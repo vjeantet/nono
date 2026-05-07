@@ -44,33 +44,41 @@ pub(crate) fn format_command_line(command: &[String]) -> String {
         .join(" ")
 }
 
-/// Render a command via [`format_command_line`] and truncate it to at most
-/// `max_len` characters, appending an ellipsis (`...`) when truncated.
+/// Truncate a string to at most `max_len` characters, appending an
+/// ellipsis (`...`) when truncated.
 ///
 /// Truncation operates on Unicode scalar values (`char`s), not bytes, so it
-/// will never split a multi-byte UTF-8 sequence — byte slicing the result
-/// of `format_command_line` is a panic hazard whenever a recorded command
-/// contains non-ASCII text. Grapheme-cluster width (e.g. emoji ZWJ
-/// sequences, combining marks) is out of scope; callers that render to a
-/// fixed-width terminal column should size `max_len` conservatively.
+/// will never split a multi-byte UTF-8 sequence — byte slicing arbitrary
+/// strings is a panic hazard whenever the input contains non-ASCII text.
+/// Grapheme-cluster width (e.g. emoji ZWJ sequences, combining marks) is
+/// out of scope; callers that render to a fixed-width terminal column
+/// should size `max_len` conservatively.
 ///
 /// Edge case: when `max_len < 3` and truncation is needed, the result is
 /// just `"..."` (3 chars), which technically exceeds `max_len`. This
 /// preserves the prior behaviour and matches the only sensible thing to
 /// do — there is no shorter way to signal truncation. Callers should pass
 /// `max_len >= 3`.
-pub(crate) fn truncate_command(command: &[String], max_len: usize) -> String {
-    let full = format_command_line(command);
+pub(crate) fn truncate_chars(s: &str, max_len: usize) -> String {
     // Fast path: byte length is always >= char count, so when bytes fit, we
     // know the char count fits too and no truncation (or char counting) is
     // needed.
-    if full.len() <= max_len {
-        return full;
+    if s.len() <= max_len {
+        return s.to_string();
     }
     let keep = max_len.saturating_sub(3);
-    let mut truncated: String = full.chars().take(keep).collect();
+    let mut truncated: String = s.chars().take(keep).collect();
     truncated.push_str("...");
     truncated
+}
+
+/// Render a command via [`format_command_line`] and truncate it to at most
+/// `max_len` characters, appending an ellipsis (`...`) when truncated.
+///
+/// Thin wrapper over [`truncate_chars`]; see that function for truncation
+/// semantics.
+pub(crate) fn truncate_command(command: &[String], max_len: usize) -> String {
+    truncate_chars(&format_command_line(command), max_len)
 }
 
 #[cfg(test)]
@@ -168,5 +176,33 @@ mod tests {
         let cmd = vec!["echo".to_string(), "hello world".to_string()];
         let result = truncate_command(&cmd, 2);
         assert_eq!(result, "...");
+    }
+
+    #[test]
+    fn truncate_chars_short_passes_through() {
+        assert_eq!(truncate_chars("hello", 40), "hello");
+    }
+
+    #[test]
+    fn truncate_chars_handles_multibyte_utf8_at_byte_boundary() {
+        // Mirrors the panic shape that bit `truncate_str` in
+        // `rollback_commands::print_side_by_side_diff`: `col_width` defaults
+        // to `(120 - 3) / 2 = 58`, so byte slicing at index 55 panics when a
+        // 4-byte UTF-8 sequence straddles that boundary.
+        //
+        // 53 ASCII bytes + 😀 (bytes 53..57) → byte 55 is mid-character.
+        let prefix: String = "x".repeat(53);
+        let line = format!("{prefix}\u{1F600}tail");
+        assert!(line.len() > 58);
+        assert!(!line.is_char_boundary(55));
+
+        let result = truncate_chars(&line, 58);
+        assert!(result.ends_with("..."));
+        assert!(result.chars().count() <= 58);
+    }
+
+    #[test]
+    fn truncate_chars_max_len_smaller_than_ellipsis() {
+        assert_eq!(truncate_chars("hello world", 2), "...");
     }
 }
