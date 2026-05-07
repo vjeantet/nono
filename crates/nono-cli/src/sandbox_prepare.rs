@@ -590,7 +590,9 @@ pub(crate) fn maybe_enable_macos_launch_services(
     }
 
     caps.add_platform_rule("(allow lsopen)")?;
-    warn!("--allow-launch-services enabled: allowing direct LaunchServices opens on macOS");
+    tracing::debug!(
+        "--allow-launch-services enabled: allowing direct LaunchServices opens on macOS"
+    );
     Ok(true)
 }
 
