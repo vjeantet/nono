@@ -335,6 +335,12 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             cleanup_capability_state_file(&cap_file_path);
             drop(config);
             drop(loaded_secrets);
+            // `std::process::exit` does NOT run destructors, so we must drop
+            // the proxy handle explicitly to fire its `Drop` impl — that's
+            // what removes the TLS-intercept trust bundle and its parent
+            // session directory under `~/.nono/sessions/`. Without this
+            // every supervised-mode session leaks a file + directory.
+            drop(proxy_handle);
             std::process::exit(exit_code);
         }
     }
