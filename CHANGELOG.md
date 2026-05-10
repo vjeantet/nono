@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.52.0] - 2026-05-10
+
+### Bug Fixes
+
+- *(diagnostic)* Parse escaped quotes in structured properties
+
+- *(env)* Preserve fail-closed semantics for empty allow_vars
+
+- *(lint)* Replace unwrap() with is_some_and() in test
+
+
+### Documentation
+
+- *(environment)* Document empty allow_vars array behavior
+
+- Restructure navigation and fix stale terminology
+
+
+### Features
+
+- *(cli)* Deprecate 'nono learn' and improve diagnostics
+
+- *(cli)* Enhance interactive experience and profile saving
+
+- *(cli)* Enhance macos learn and run diagnostics
+
+- *(env)* Add operator-controlled deny_vars to EnvironmentConfig
+
+
+### Refactoring
+
+- *(env)* Extract matches_env_var_patterns helper, fix docs wording
+
+
+### Style
+
+- Run cargo fmt
+
 ## [0.51.0] - 2026-05-09
 
 ### Bug Fixes
