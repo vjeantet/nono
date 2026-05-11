@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.53.0] - 2026-05-11
+
+### Bug Fixes
+
+- Absolute match / 2 matches = deny / no match = passthrough w no creds
+
+- Review comments
+
+- Return full failure diagnostic
+
+- *(sandbox)* Cache Landlock ABI detection with OnceLock
+
+
+### Features
+
+- Fix upstream TLS trust, intercept auth, and multi-route dispatch.
+
+- *(core)* Scrub command arguments for secrets
+
+
+### Refactoring
+
+- *(scrub)* Optimize and simplify scrubbing logic
+
 ## [0.52.2] - 2026-05-11
 
 ### Bug Fixes
