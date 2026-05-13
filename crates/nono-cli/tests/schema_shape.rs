@@ -34,6 +34,23 @@ fn test_schema_has_canonical_top_level_commands() {
 }
 
 #[test]
+fn test_schema_has_linux_af_unix_mediation() {
+    let schema = load_schema();
+    assert!(
+        schema.pointer("/properties/linux").is_some(),
+        "schema is missing canonical /properties/linux"
+    );
+    let props = schema
+        .pointer("/$defs/LinuxConfig/properties")
+        .and_then(Value::as_object)
+        .expect("LinuxConfig.properties is an object");
+    assert!(
+        props.contains_key("af_unix_mediation"),
+        "LinuxConfig.af_unix_mediation missing from canonical schema"
+    );
+}
+
+#[test]
 fn test_schema_groups_has_include_and_exclude() {
     let schema = load_schema();
     let props = schema

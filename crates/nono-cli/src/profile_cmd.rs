@@ -923,6 +923,13 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
             theme::fg(&format!("{policy:?}"), t.text)
         );
     }
+    if let Some(mode) = profile.linux.af_unix_mediation {
+        println!(
+            "  {} {}",
+            theme::fg("Linux AF_UNIX mediation:", t.subtext),
+            theme::fg(&format!("{mode:?}"), t.text)
+        );
+    }
 
     // Filesystem
     let fs = &profile.filesystem;
@@ -1159,6 +1166,9 @@ fn profile_to_json(
         security.insert("wsl2_proxy_policy".into(), serde_json::json!(v));
     }
     val["security"] = serde_json::Value::Object(security);
+    if let Some(v) = profile.linux.af_unix_mediation {
+        val["linux"] = serde_json::json!({ "af_unix_mediation": v });
+    }
 
     // Filesystem (canonical schema — `allow`/`read`/`write`/`*_file`/`deny`/
     // `bypass_protection`). Legacy keys deserialize into these fields via
@@ -1387,6 +1397,12 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
         "wsl2_proxy_policy",
         &p1.security.wsl2_proxy_policy.map(|v| format!("{v:?}")),
         &p2.security.wsl2_proxy_policy.map(|v| format!("{v:?}")),
+        t,
+    );
+    any_diff |= diff_scalar_option(
+        "linux.af_unix_mediation",
+        &p1.linux.af_unix_mediation.map(|v| format!("{v:?}")),
+        &p2.linux.af_unix_mediation.map(|v| format!("{v:?}")),
         t,
     );
     any_diff |= diff_scalar_option(
@@ -1899,6 +1915,13 @@ fn diff_to_json(name1: &str, name2: &str, p1: &Profile, p2: &Profile) -> serde_j
             "profile1": p1.security.wsl2_proxy_policy,
             "profile2": p2.security.wsl2_proxy_policy,
             "changed": p1.security.wsl2_proxy_policy != p2.security.wsl2_proxy_policy,
+        },
+        "linux": {
+            "af_unix_mediation": {
+                "profile1": p1.linux.af_unix_mediation,
+                "profile2": p2.linux.af_unix_mediation,
+                "changed": p1.linux.af_unix_mediation != p2.linux.af_unix_mediation,
+            }
         },
         "filesystem": diff_fs_json(&p1.filesystem, &p2.filesystem),
         "workdir": {

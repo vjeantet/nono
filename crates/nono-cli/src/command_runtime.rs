@@ -144,6 +144,8 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
             capability_elevation: prepared.capability_elevation,
             #[cfg(target_os = "linux")]
             wsl2_proxy_policy: prepared.wsl2_proxy_policy,
+            #[cfg(target_os = "linux")]
+            af_unix_mediation: prepared.af_unix_mediation,
             bypass_protection_paths: prepared.bypass_protection_paths,
             ignored_denial_paths: prepared.ignored_denial_paths,
             allowed_env_vars: prepared.allowed_env_vars,
@@ -197,6 +199,15 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
         return Err(NonoError::ConfigParse(
             "nono wrap does not support proxy mode (activated by profile network settings). \
              Use `nono run` instead."
+                .to_string(),
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    if prepared.af_unix_mediation.is_pathname() {
+        return Err(NonoError::ConfigParse(
+            "nono wrap does not support linux.af_unix_mediation = \"pathname\" because direct \
+             exec cannot run the seccomp supervisor. Use `nono run` instead."
                 .to_string(),
         ));
     }

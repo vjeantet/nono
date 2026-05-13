@@ -1232,6 +1232,40 @@ pub enum Wsl2ProxyPolicy {
     InsecureProxy,
 }
 
+/// Linux pathname AF_UNIX seccomp mediation mode.
+///
+/// When set to `pathname`, pathname Unix socket `connect(2)` and `bind(2)`
+/// calls are mediated by the supervisor and must match explicit
+/// `filesystem.unix_socket*` grants. The default `off` mode preserves
+/// compatibility: filesystem grants may still make pathname sockets reachable
+/// on Landlock V4+.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LinuxAfUnixMediation {
+    /// Do not install the V4+ AF_UNIX-only seccomp mediation filter.
+    #[default]
+    Off,
+    /// Mediate pathname AF_UNIX sockets through explicit socket grants.
+    Pathname,
+}
+
+impl LinuxAfUnixMediation {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[must_use]
+    pub fn is_pathname(self) -> bool {
+        matches!(self, LinuxAfUnixMediation::Pathname)
+    }
+}
+
+/// Linux-specific profile controls.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinuxConfig {
+    /// Opt-in pathname AF_UNIX mediation mode.
+    #[serde(default)]
+    pub af_unix_mediation: Option<LinuxAfUnixMediation>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WorkdirAccess {
@@ -1419,6 +1453,8 @@ pub struct Profile {
     pub filesystem: FilesystemConfig,
     #[serde(default)]
     pub network: NetworkConfig,
+    #[serde(default)]
+    pub linux: LinuxConfig,
     /// ALIAS(canonical="env_credentials", introduced="v0.0.0", remove_by="indefinite", issue="#143")
     #[serde(default, alias = "secrets")]
     pub env_credentials: SecretsConfig,
@@ -1505,6 +1541,8 @@ struct ProfileDeserialize {
     policy: crate::deprecated_schema::LegacyPolicyPatch,
     #[serde(default)]
     network: NetworkConfig,
+    #[serde(default)]
+    linux: LinuxConfig,
     /// ALIAS(canonical="env_credentials", introduced="v0.0.0", remove_by="indefinite", issue="#143")
     #[serde(default, alias = "secrets")]
     env_credentials: SecretsConfig,
@@ -1553,6 +1591,7 @@ impl From<ProfileDeserialize> for Profile {
             commands: raw.commands,
             filesystem: raw.filesystem,
             network: raw.network,
+            linux: raw.linux,
             env_credentials: raw.env_credentials,
             environment: raw.environment,
             workdir: raw.workdir,
@@ -2409,6 +2448,12 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 &base.network.upstream_bypass,
                 &child.network.upstream_bypass,
             ),
+        },
+        linux: LinuxConfig {
+            af_unix_mediation: child
+                .linux
+                .af_unix_mediation
+                .or(base.linux.af_unix_mediation),
         },
         env_credentials: SecretsConfig {
             mappings: {
@@ -4258,6 +4303,7 @@ mod tests {
                 upstream_proxy: None,
                 upstream_bypass: Vec::new(),
             },
+            linux: LinuxConfig::default(),
             env_credentials: SecretsConfig {
                 mappings: {
                     let mut m = HashMap::new();
@@ -4335,6 +4381,7 @@ mod tests {
                 upstream_proxy: None,
                 upstream_bypass: Vec::new(),
             },
+            linux: LinuxConfig::default(),
             env_credentials: SecretsConfig {
                 mappings: {
                     let mut m = HashMap::new();
@@ -4389,6 +4436,30 @@ mod tests {
         let merged = merge_profiles(base_profile(), child_profile());
         // base has [3000], child has [3000, 5000] — merged should dedup to [3000, 5000]
         assert_eq!(merged.network.open_port, vec![3000, 5000]);
+    }
+
+    #[test]
+    fn test_profile_parses_linux_af_unix_mediation() {
+        let json = r#"{
+            "meta": {"name": "linux-ipc", "version": "1.0"},
+            "linux": {"af_unix_mediation": "pathname"}
+        }"#;
+        let profile: Profile = serde_json::from_str(json).expect("parse profile");
+        assert_eq!(
+            profile.linux.af_unix_mediation,
+            Some(LinuxAfUnixMediation::Pathname)
+        );
+    }
+
+    #[test]
+    fn test_merge_profiles_inherits_linux_af_unix_mediation() {
+        let mut base = base_profile();
+        base.linux.af_unix_mediation = Some(LinuxAfUnixMediation::Pathname);
+        let merged = merge_profiles(base, child_profile());
+        assert_eq!(
+            merged.linux.af_unix_mediation,
+            Some(LinuxAfUnixMediation::Pathname)
+        );
     }
 
     #[test]
