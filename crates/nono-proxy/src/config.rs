@@ -133,14 +133,11 @@ pub struct RouteConfig {
     #[serde(default = "default_inject_header")]
     pub inject_header: String,
 
-    /// Format string for the credential value. `{}` is replaced with the secret.
+    /// How the injected header value is built (`{}` is replaced by the secret). Only when `inject_mode` is header.
     ///
-    /// When omitted (`None`), the effective format is chosen at load time:
-    /// `Bearer {}` for the `Authorization` header, `{}` for any other header name.
-    /// When set to any string (including explicit `Bearer {}` on a custom header),
-    /// that format is used exactly.
+    /// If you set this field, that whole string is used as-is — `Authorization` or any other header.
     ///
-    /// Only used when inject_mode is "header".
+    /// If you omit it: an `Authorization` header (any capitalization) defaults to `Bearer {}`; any other header defaults to `{}` (secret only, no prefix).
     #[serde(default)]
     pub credential_format: Option<String>,
 
@@ -376,18 +373,15 @@ fn default_inject_header() -> String {
     "Authorization".to_string()
 }
 
-/// Resolve the credential header format for injection.
+/// Template for the header value before `{}` is replaced by the secret.
 ///
-/// When `credential_format` is `None` (field omitted from config), uses `Bearer {}`
-/// for the `Authorization` header and `{}` for all other header names. When `Some`,
-/// returns that format unchanged so explicit values (including `Bearer {}` on a
-/// non-Authorization header) are honored.
+/// Set in config → use that string as-is. Omitted → `Bearer {}` for an `Authorization` header (case-insensitive), `{}` for any other header.
 #[must_use]
 pub fn resolved_credential_format(inject_header: &str, credential_format: Option<&str>) -> String {
     match credential_format {
         Some(fmt) => fmt.to_string(),
         None => {
-            if inject_header == "Authorization" {
+            if inject_header.eq_ignore_ascii_case("Authorization") {
                 "Bearer {}".to_string()
             } else {
                 "{}".to_string()
@@ -871,5 +865,16 @@ mod tests {
             resolved_credential_format(&route.inject_header, route.credential_format.as_deref()),
             "Bearer {}"
         );
+    }
+
+    #[test]
+    fn test_resolved_credential_format_authorization_case_insensitive() {
+        for header in ["authorization", "AUTHORIZATION", "Authorization"] {
+            assert_eq!(
+                resolved_credential_format(header, None),
+                "Bearer {}",
+                "omitted format: Authorization header name is matched case-insensitively for Bearer default"
+            );
+        }
     }
 }

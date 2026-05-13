@@ -483,7 +483,7 @@
             { "type": "string" },
             { "type": "null" }
           ],
-          "description": "Format string for the credential value, using {} as placeholder. Only used when inject_mode is \"header\". When omitted, the proxy uses Bearer {} for the Authorization header and {} for other header names; when set, the value is used exactly (including explicit Bearer {} on a custom header)."
+          "description": "Template with {} for the secret (header inject mode). If set, used as-is. If omitted: Authorization header (case-insensitive) defaults to Bearer {}; other headers default to {} (secret only)."
         },
         "path_pattern": {
           "oneOf": [

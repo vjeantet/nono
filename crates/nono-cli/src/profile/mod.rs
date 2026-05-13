@@ -263,12 +263,11 @@ pub struct CustomCredentialDef {
     /// Only used when inject_mode is "header".
     #[serde(default = "default_inject_header")]
     pub inject_header: String,
-    /// Format string for the credential value (default: inferred at proxy load).
+    /// How the injected header value is built (`{}` is replaced by the secret). Only when `inject_mode` is header.
     ///
-    /// When omitted, the proxy uses `Bearer {}` for the `Authorization` header and
-    /// `{}` for other header names. When set, the value is used exactly (including
-    /// explicit `Bearer {}` on a custom header).
-    /// Only used when inject_mode is "header".
+    /// If you set this field, that whole string is used as-is — `Authorization` or any other header.
+    ///
+    /// If you omit it: an `Authorization` header (any capitalization) defaults to `Bearer {}`; any other header defaults to `{}` (secret only, no prefix).
     #[serde(default)]
     pub credential_format: Option<String>,
 
@@ -432,7 +431,7 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
 ///   `op://` / `apple-password://` / `file://` / `env://` URI
 /// - `upstream` must be HTTPS (or HTTP for loopback only)
 /// - Mode-specific validation:
-///   - `header`: inject_header must be valid HTTP token, credential_format no CRLF
+///   - `header`: inject_header must be valid HTTP token; effective format (see field doc) must not contain CR/LF
 ///   - `url_path`: path_pattern required, no CRLF in patterns
 ///   - `query_param`: query_param_name required, valid query param name
 ///   - `basic_auth`: no additional required fields

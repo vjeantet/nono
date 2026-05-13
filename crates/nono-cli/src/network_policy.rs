@@ -67,7 +67,7 @@ pub struct CredentialDef {
     pub credential_key: Option<String>,
     #[serde(default = "default_inject_header")]
     pub inject_header: String,
-    /// When omitted, effective format is resolved at proxy load time from the header name.
+    /// Same as the proxy route field: if set, used as-is; if omitted, `Bearer {}` for `Authorization` (case-insensitive), else `{}`.
     #[serde(default)]
     pub credential_format: Option<String>,
     /// Explicit environment variable name for the phantom token.
