@@ -785,6 +785,7 @@ fn install_package(
         downloaded_by_name.insert(artifact.filename.as_str(), artifact);
     }
 
+    validate_manifest_install_paths(manifest)?;
     write_supporting_artifacts(&staging_root, manifest, downloads)?;
 
     let mut copied_to_project = 0usize;
@@ -1017,17 +1018,19 @@ fn update_lockfile(
                 ))
             })?;
         let installed_path = installed_artifact_relative_path(artifact)?;
-        let previous = artifacts.insert(
-            installed_path,
-            LockedArtifact {
-                sha256: downloaded.sha256_digest.clone(),
-                artifact_type: artifact.artifact_type.clone(),
-            },
-        );
-        if previous.is_some() {
+        if artifacts
+            .insert(
+                installed_path.clone(),
+                LockedArtifact {
+                    sha256: downloaded.sha256_digest.clone(),
+                    artifact_type: artifact.artifact_type.clone(),
+                },
+            )
+            .is_some()
+        {
             return Err(NonoError::PackageInstall(format!(
-                "multiple artifacts install to the same path for '{}'",
-                artifact.path
+                "multiple artifacts install to the same path '{}' (conflict at '{}')",
+                installed_path, artifact.path
             )));
         }
     }
@@ -1056,6 +1059,20 @@ fn update_lockfile(
     );
 
     package::write_lockfile(&lockfile)
+}
+
+fn validate_manifest_install_paths(manifest: &PackageManifest) -> Result<()> {
+    let mut installed_paths = HashSet::with_capacity(manifest.artifacts.len());
+    for artifact in &manifest.artifacts {
+        let installed_path = installed_artifact_relative_path(artifact)?;
+        if !installed_paths.insert(installed_path.clone()) {
+            return Err(NonoError::PackageInstall(format!(
+                "multiple artifacts install to the same path '{}' (conflict at '{}')",
+                installed_path, artifact.path
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn enforce_namespace_assertion(
@@ -1166,7 +1183,7 @@ fn file_name(path: &str) -> Result<&str> {
 }
 
 fn installed_artifact_relative_path(artifact: &ArtifactEntry) -> Result<String> {
-    match artifact.artifact_type {
+    let path = match artifact.artifact_type {
         ArtifactType::Profile => {
             let install_name = artifact.install_as.as_deref().ok_or_else(|| {
                 NonoError::PackageInstall(format!(
@@ -1175,19 +1192,26 @@ fn installed_artifact_relative_path(artifact: &ArtifactEntry) -> Result<String> 
                 ))
             })?;
             validate_safe_name(install_name, "install_as")?;
-            Ok(format!("profiles/{install_name}.json"))
+            format!("profiles/{install_name}.json")
         }
         ArtifactType::Instruction => {
             validate_relative_path(&artifact.path)?;
-            Ok(format!("instructions/{}", file_name(&artifact.path)?))
+            format!("instructions/{}", file_name(&artifact.path)?)
         }
-        ArtifactType::TrustPolicy => Ok("trust-policy.json".to_string()),
-        ArtifactType::Groups => Ok("groups.json".to_string()),
+        ArtifactType::TrustPolicy => "trust-policy.json".to_string(),
+        ArtifactType::Groups => "groups.json".to_string(),
         ArtifactType::Plugin => {
             validate_relative_path(&artifact.path)?;
-            Ok(artifact.path.clone())
+            artifact.path.clone()
         }
+    };
+    if path == "package.json" || path == ".nono-trust.bundle" {
+        return Err(NonoError::PackageInstall(format!(
+            "artifact '{}' attempts to overwrite reserved file '{}'",
+            artifact.path, path
+        )));
     }
+    Ok(path)
 }
 
 fn validate_safe_name(name: &str, field: &str) -> Result<()> {
