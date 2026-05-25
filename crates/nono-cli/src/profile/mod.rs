@@ -263,11 +263,13 @@ pub struct CustomCredentialDef {
     /// Only used when inject_mode is "header".
     #[serde(default = "default_inject_header")]
     pub inject_header: String,
-    /// Format string for the credential value (default: "Bearer {}")
-    /// Use {} as placeholder for the credential value.
-    /// Only used when inject_mode is "header".
-    #[serde(default = "default_credential_format")]
-    pub credential_format: String,
+    /// How the injected header value is built (`{}` is replaced by the secret). Only when `inject_mode` is header.
+    ///
+    /// If you set this field, that whole string is used as-is — `Authorization` or any other header.
+    ///
+    /// If you omit it: an `Authorization` header (any capitalization) defaults to `Bearer {}`; any other header defaults to `{}` (secret only, no prefix).
+    #[serde(default)]
+    pub credential_format: Option<String>,
 
     // --- URL path mode fields ---
     /// Pattern to match in incoming URL path. Use {} as placeholder for phantom token.
@@ -340,10 +342,6 @@ pub struct CustomCredentialDef {
 
 fn default_inject_header() -> String {
     "Authorization".to_string()
-}
-
-fn default_credential_format() -> String {
-    "Bearer {}".to_string()
 }
 
 /// Check if a character is a valid HTTP token character per RFC 7230.
@@ -433,7 +431,7 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
 ///   `op://` / `apple-password://` / `file://` / `env://` URI
 /// - `upstream` must be HTTPS (or HTTP for loopback only)
 /// - Mode-specific validation:
-///   - `header`: inject_header must be valid HTTP token, credential_format no CRLF
+///   - `header`: inject_header must be valid HTTP token; effective format (see field doc) must not contain CR/LF
 ///   - `url_path`: path_pattern required, no CRLF in patterns
 ///   - `query_param`: query_param_name required, valid query param name
 ///   - `basic_auth`: no additional required fields
@@ -554,10 +552,14 @@ fn validate_proxy_override(name: &str, cred: &CustomCredentialDef) -> Result<()>
             }
 
             if *mode == InjectMode::Header {
+                let parent_resolved = nono_proxy::config::resolved_credential_format(
+                    cred.inject_header.as_str(),
+                    cred.credential_format.as_deref(),
+                );
                 let format = proxy
                     .credential_format
                     .as_deref()
-                    .unwrap_or(cred.credential_format.as_str());
+                    .unwrap_or(parent_resolved.as_str());
                 if format.contains('\r') || format.contains('\n') {
                     return Err(NonoError::ProfileParse(format!(
                         "proxy.credential_format for custom credential '{}' contains invalid CRLF characters; \
@@ -691,8 +693,12 @@ fn validate_header_mode(name: &str, cred: &CustomCredentialDef) -> Result<()> {
         )));
     }
 
-    // Validate credential_format (no CRLF injection)
-    if cred.credential_format.contains('\r') || cred.credential_format.contains('\n') {
+    // Validate effective credential_format (no CRLF injection)
+    let effective_format = nono_proxy::config::resolved_credential_format(
+        cred.inject_header.as_str(),
+        cred.credential_format.as_deref(),
+    );
+    if effective_format.contains('\r') || effective_format.contains('\n') {
         return Err(NonoError::ProfileParse(format!(
             "credential_format for custom credential '{}' contains invalid CRLF characters; \
              this could enable header injection attacks",
@@ -987,10 +993,7 @@ pub struct NetworkConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub credentials: Option<Vec<String>>,
-    /// Localhost TCP ports to allow bidirectional IPC (connect + bind).
-    /// Equivalent to `--open-port` CLI flag.
-    /// Canonical profile key: `open_port` (legacy `port_allow` and `allow_port`
-    /// are also accepted).
+    /// Localhost TCP IPC (`--open-port`). **`0`**: macOS only, means `localhost:*` outbound.
     /// ALIAS(canonical="open_port", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[serde(
         default,
@@ -1500,6 +1503,11 @@ pub struct Profile {
     /// Each entry is a `<namespace>/<name>` reference to an installed pack.
     #[serde(default)]
     pub packs: Vec<String>,
+    /// Binary path or command name to run when no trailing `-- <command>` is given.
+    /// Resolved via `PATH` lookup or canonicalized if absolute. Only honoured
+    /// for user-authored profiles (ignored for pack and built-in profiles).
+    #[serde(default)]
+    pub binary: Option<String>,
     /// Extra arguments appended to the child command at launch.
     /// Supports variable expansion (e.g. `$NONO_PACKAGES`).
     #[serde(default)]
@@ -1568,6 +1576,8 @@ struct ProfileDeserialize {
     skipdirs: Vec<String>,
     #[serde(default)]
     packs: Vec<String>,
+    #[serde(default)]
+    binary: Option<String>,
     /// ALIAS(canonical="command_args", introduced="v0.0.0", remove_by="indefinite", issue="N/A")
     #[serde(default)]
     #[serde(alias = "brokered_commands")]
@@ -1604,6 +1614,7 @@ impl From<ProfileDeserialize> for Profile {
             interactive: raw.interactive,
             skipdirs: raw.skipdirs,
             packs: raw.packs,
+            binary: raw.binary,
             command_args: raw.command_args,
             unsafe_macos_seatbelt_rules: raw.unsafe_macos_seatbelt_rules,
         };
@@ -1637,7 +1648,7 @@ pub fn is_user_override(name: &str) -> bool {
     if !is_valid_profile_name(name) {
         return false;
     }
-    get_user_profile_path(name)
+    resolve_user_profile_path(name)
         .map(|p| p.exists())
         .unwrap_or(false)
 }
@@ -1658,7 +1669,7 @@ pub fn load_profile_extends(name_or_path: &str) -> Option<Vec<String>> {
     let _suppress = crate::deprecation_warnings::WarningSuppressionGuard::begin();
 
     // Direct file path
-    if name_or_path.contains('/') || name_or_path.ends_with(".json") {
+    if is_file_path_ref(name_or_path) {
         return parse_profile_file(Path::new(name_or_path))
             .ok()
             .and_then(|p| p.extends);
@@ -1669,7 +1680,7 @@ pub fn load_profile_extends(name_or_path: &str) -> Option<Vec<String>> {
     }
 
     // User profile
-    if let Ok(profile_path) = get_user_profile_path(name_or_path)
+    if let Ok(profile_path) = resolve_user_profile_path(name_or_path)
         && profile_path.exists()
     {
         return parse_profile_file(&profile_path)
@@ -1807,7 +1818,7 @@ fn load_profile_inner(name_or_path: &str) -> Result<Option<Profile>> {
     if is_registry_ref(name_or_path) {
         return load_registry_profile(name_or_path).map(Some);
     }
-    if name_or_path.contains('/') || name_or_path.ends_with(".json") {
+    if is_file_path_ref(name_or_path) {
         return load_profile_from_path(Path::new(name_or_path)).map(Some);
     }
     if !is_valid_profile_name(name_or_path) {
@@ -1816,7 +1827,7 @@ fn load_profile_inner(name_or_path: &str) -> Result<Option<Profile>> {
             name_or_path
         )));
     }
-    let profile_path = get_user_profile_path(name_or_path)?;
+    let profile_path = resolve_user_profile_path(name_or_path)?;
     if profile_path.exists() {
         tracing::info!("Loading user profile from: {}", profile_path.display());
         return finalize_profile(load_from_file(&profile_path)?).map(Some);
@@ -1892,6 +1903,35 @@ pub(crate) fn find_pack_store_profile(name: &str) -> Option<(PathBuf, String)> {
     if !store.exists() {
         return None;
     }
+
+    // Fast path: if name is in `org/pack-name[@version]` format, look up the
+    // pack directly rather than scanning every pack's install_as values.
+    // parse_package_ref strips the optional @version so we always look under
+    // the installed `packages/org/pack` directory, not `packages/org/pack@ver`.
+    if is_registry_ref(name) {
+        return (|| {
+            let pkg = crate::package::parse_package_ref(name).ok()?;
+            let pack_path = store.join(&pkg.namespace).join(&pkg.name);
+            if !pack_path.is_dir() {
+                return None;
+            }
+            let manifest_str = std::fs::read_to_string(pack_path.join("package.json")).ok()?;
+            let manifest: crate::package::PackageManifest =
+                serde_json::from_str(&manifest_str).ok()?;
+            manifest
+                .artifacts
+                .iter()
+                .filter(|a| a.artifact_type == crate::package::ArtifactType::Profile)
+                .find_map(|a| {
+                    let install_as = a.install_as.as_deref()?;
+                    let profile_file = pack_path
+                        .join("profiles")
+                        .join(format!("{install_as}.json"));
+                    profile_file.exists().then(|| (profile_file, pkg.key()))
+                })
+        })();
+    }
+
     let mut matches: Vec<(String, PathBuf)> = Vec::new();
     let ns_entries = std::fs::read_dir(&store).ok()?;
     for ns_entry in ns_entries.flatten() {
@@ -1964,6 +2004,13 @@ pub(crate) fn is_registry_ref(s: &str) -> bool {
         && !s.starts_with('/')
         && !s.ends_with(".json")
         && parts.iter().all(|p| !p.is_empty())
+}
+
+/// Returns true if the profile name looks like a direct filesystem path
+/// (contains path separators or has a recognized profile file extension)
+/// rather than a simple profile name or registry reference.
+pub(crate) fn is_file_path_ref(s: &str) -> bool {
+    !is_registry_ref(s) && (s.contains('/') || s.ends_with(".json") || s.ends_with(".jsonc"))
 }
 
 /// Load a profile from a registry pack. If the pack isn't installed locally,
@@ -2133,8 +2180,17 @@ fn parse_profile_file(path: &Path) -> Result<Profile> {
 }
 
 pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
-    let profile: Profile =
-        serde_json::from_slice(content).map_err(|e| NonoError::ProfileParse(e.to_string()))?;
+    let text = std::str::from_utf8(content)
+        .map_err(|e| NonoError::ProfileParse(format!("invalid UTF-8: {e}")))?;
+
+    let parse_options = jsonc_parser::ParseOptions {
+        allow_comments: true,
+        allow_trailing_commas: true,
+        ..Default::default()
+    };
+
+    let profile: Profile = jsonc_parser::parse_to_serde_value(text, &parse_options)
+        .map_err(|e| NonoError::ProfileParse(e.to_string()))?;
 
     // Validate custom credentials for security issues
     validate_profile_custom_credentials(&profile)?;
@@ -2272,7 +2328,7 @@ fn load_base_profile_raw(
     context_dir: Option<&Path>,
     source_file: Option<&Path>,
 ) -> Result<ResolvedBase> {
-    if !is_valid_profile_name(name) {
+    if !is_valid_profile_name(name) && !is_registry_ref(name) {
         return Err(NonoError::ProfileInheritance(format!(
             "invalid base profile name '{}'",
             name
@@ -2299,7 +2355,7 @@ fn load_base_profile_raw(
     }
 
     // 1. User profiles take precedence.
-    let profile_path = get_user_profile_path(name)?;
+    let profile_path = resolve_user_profile_path(name)?;
     if profile_path.exists() {
         return Ok(ResolvedBase::Global(parse_profile_file(&profile_path)?));
     }
@@ -2531,6 +2587,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
         interactive: base.interactive || child.interactive,
         skipdirs: dedup_append(&base.skipdirs, &child.skipdirs),
         packs: dedup_append(&base.packs, &child.packs),
+        binary: child.binary.or(base.binary),
         command_args: dedup_append(&base.command_args, &child.command_args),
         unsafe_macos_seatbelt_rules: dedup_append(
             &base.unsafe_macos_seatbelt_rules,
@@ -2551,9 +2608,23 @@ pub(crate) fn dedup_append<T: Eq + std::hash::Hash + Clone>(base: &[T], child: &
     result
 }
 
-/// Get the path to a user profile
+/// Get the path to a user profile (default `.json` extension, used for writes).
 pub(crate) fn get_user_profile_path(name: &str) -> Result<PathBuf> {
     Ok(user_profile_dir()?.join(format!("{}.json", name)))
+}
+
+/// Resolve an existing user profile, preferring `.jsonc` over `.json`.
+///
+/// Returns the path to the first file that exists, checking `.jsonc` first.
+/// Falls back to the default `.json` path if neither exists (for callers
+/// that check `.exists()` themselves).
+pub(crate) fn resolve_user_profile_path(name: &str) -> Result<PathBuf> {
+    let dir = user_profile_dir()?;
+    let jsonc_path = dir.join(format!("{name}.jsonc"));
+    if jsonc_path.exists() {
+        return Ok(jsonc_path);
+    }
+    Ok(dir.join(format!("{name}.json")))
 }
 
 pub(crate) fn user_profile_dir() -> Result<PathBuf> {
@@ -2736,13 +2807,17 @@ pub fn list_profiles() -> Vec<String> {
     let mut profiles = builtin::list_builtin();
 
     // Add user profiles (if home directory is available)
-    if let Ok(profile_path) = get_user_profile_path("")
-        && let Some(dir) = profile_path.parent()
+    if let Ok(dir) = user_profile_dir()
         && dir.exists()
         && let Ok(entries) = fs::read_dir(dir)
     {
         for entry in entries.flatten() {
-            if let Some(name) = entry.path().file_stem() {
+            let path = entry.path();
+            let is_profile_ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|ext| ext == "json" || ext == "jsonc");
+            if is_profile_ext && let Some(name) = path.file_stem() {
                 let name_str = name.to_string_lossy().to_string();
                 if !profiles.contains(&name_str) {
                     profiles.push(name_str);
@@ -3584,7 +3659,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -3632,7 +3707,7 @@ mod tests {
     #[test]
     fn test_validate_custom_credential_invalid_format_rejected() {
         let mut cred = header_cred_builder();
-        cred.credential_format = "Bearer {}\r\nEvil: header".to_string();
+        cred.credential_format = Some("Bearer {}\r\nEvil: header".to_string());
         let result = validate_custom_credential("test", &cred);
         let err = result.expect_err("CRLF in format should be rejected");
         assert!(err.to_string().contains("CRLF"));
@@ -3684,7 +3759,7 @@ mod tests {
     #[test]
     fn test_validate_custom_credential_format_with_cr_rejected() {
         let mut cred = header_cred_builder();
-        cred.credential_format = "Bearer {}\rEvil: header".to_string();
+        cred.credential_format = Some("Bearer {}\rEvil: header".to_string());
         let result = validate_custom_credential("test", &cred);
         let err = result.expect_err("CR in format should be rejected");
         assert!(err.to_string().contains("CRLF"));
@@ -3693,7 +3768,7 @@ mod tests {
     #[test]
     fn test_validate_custom_credential_format_with_lf_rejected() {
         let mut cred = header_cred_builder();
-        cred.credential_format = "Bearer {}\nEvil: header".to_string();
+        cred.credential_format = Some("Bearer {}\nEvil: header".to_string());
         let result = validate_custom_credential("test", &cred);
         let err = result.expect_err("LF in format should be rejected");
         assert!(err.to_string().contains("CRLF"));
@@ -3703,7 +3778,7 @@ mod tests {
     fn test_validate_custom_credential_various_valid_formats() {
         for format in ["Bearer {}", "Token {}", "{}", "Basic {}", "ApiKey={}"] {
             let mut cred = header_cred_builder();
-            cred.credential_format = format.to_string();
+            cred.credential_format = Some(format.to_string());
             assert!(
                 validate_custom_credential("test", &cred).is_ok(),
                 "Expected format '{}' to be valid",
@@ -3748,7 +3823,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::UrlPath,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: Some("/bot{}/".to_string()),
             path_replacement: None,
             query_param_name: None,
@@ -3770,7 +3845,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::UrlPath,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None, // Missing required field
             path_replacement: None,
             query_param_name: None,
@@ -3794,7 +3869,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::UrlPath,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: Some("/bot/token/".to_string()), // No {} placeholder
             path_replacement: None,
             query_param_name: None,
@@ -3818,7 +3893,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::UrlPath,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: Some("/bot{}/".to_string()),
             path_replacement: Some("/v2/bot{}/".to_string()),
             query_param_name: None,
@@ -3840,7 +3915,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::UrlPath,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: Some("/bot{}/".to_string()),
             path_replacement: Some("/v2/bot/fixed/".to_string()), // No {} placeholder
             query_param_name: None,
@@ -3864,7 +3939,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::QueryParam,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: Some("key".to_string()),
@@ -3886,7 +3961,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::QueryParam,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None, // Missing required field
@@ -3910,7 +3985,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::QueryParam,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: Some("".to_string()), // Empty
@@ -3934,7 +4009,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::BasicAuth,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -4095,7 +4170,7 @@ mod tests {
             }),
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -4355,6 +4430,7 @@ mod tests {
             interactive: false,
             skipdirs: vec!["vendor".to_string()],
             packs: vec![],
+            binary: None,
             command_args: vec![],
             unsafe_macos_seatbelt_rules: vec![],
         }
@@ -4433,6 +4509,7 @@ mod tests {
             interactive: false,
             skipdirs: vec!["dist".to_string()],
             packs: vec![],
+            binary: None,
             command_args: vec![],
             unsafe_macos_seatbelt_rules: vec![],
         }
@@ -4529,7 +4606,7 @@ mod tests {
                 auth: None,
                 inject_mode: InjectMode::Header,
                 inject_header: "Authorization".to_string(),
-                credential_format: "Bearer {}".to_string(),
+                credential_format: Some("Bearer {}".to_string()),
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
@@ -4551,7 +4628,7 @@ mod tests {
                 auth: None,
                 inject_mode: InjectMode::Header,
                 inject_header: "Authorization".to_string(),
-                credential_format: "Token {}".to_string(),
+                credential_format: Some("Token {}".to_string()),
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
@@ -4691,7 +4768,7 @@ mod tests {
                 auth: None,
                 inject_mode: InjectMode::Header,
                 inject_header: "Authorization".to_string(),
-                credential_format: "Bearer {}".to_string(),
+                credential_format: Some("Bearer {}".to_string()),
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
@@ -4713,7 +4790,7 @@ mod tests {
                 auth: None,
                 inject_mode: InjectMode::Header,
                 inject_header: "Authorization".to_string(),
-                credential_format: "Token {}".to_string(),
+                credential_format: Some("Token {}".to_string()),
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
@@ -6015,7 +6092,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -6040,7 +6117,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -6068,7 +6145,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -6096,7 +6173,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -6156,7 +6233,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -6178,7 +6255,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -6312,6 +6389,102 @@ mod tests {
         assert!(
             err.to_string().contains("unknown field"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn jsonc_comments_and_trailing_commas() {
+        let jsonc = br#"{
+            // Profile for my agent
+            "meta": {
+                "name": "jsonc-test",
+                "description": "Testing JSONC features", // inline comment
+            },
+            "filesystem": {
+                /* Grant read to source,
+                   write to output */
+                "read": ["/src"],
+                "write": ["/output"],
+            },
+            "network": {
+                "block": true, // no network access
+            },
+        }"#;
+
+        let profile = parse_profile_bytes(jsonc).expect("JSONC with comments and trailing commas");
+        assert_eq!(profile.meta.name, "jsonc-test");
+        assert_eq!(profile.filesystem.read, vec!["/src"]);
+        assert_eq!(profile.filesystem.write, vec!["/output"]);
+        assert!(profile.network.block);
+    }
+
+    #[test]
+    fn jsonc_resolve_prefers_jsonc_extension() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let canonical = dir.path().canonicalize().expect("canonicalize tempdir");
+        let canonical_str = canonical.to_str().expect("tempdir is valid UTF-8");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", canonical_str)]);
+
+        let profiles_dir = canonical.join("nono").join("profiles");
+        std::fs::create_dir_all(&profiles_dir).expect("create profiles dir");
+
+        std::fs::write(
+            profiles_dir.join("myprofile.jsonc"),
+            b"{ \"meta\": { \"name\": \"from-jsonc\" } }",
+        )
+        .expect("write jsonc");
+        std::fs::write(
+            profiles_dir.join("myprofile.json"),
+            b"{ \"meta\": { \"name\": \"from-json\" } }",
+        )
+        .expect("write json");
+
+        let resolved = resolve_user_profile_path("myprofile").expect("resolve");
+        assert!(
+            resolved.extension().and_then(|e| e.to_str()) == Some("jsonc"),
+            "should prefer .jsonc: {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn profile_binary_field_parses_and_inherits() {
+        let base = br#"{
+            "meta": { "name": "base" },
+            "binary": "/usr/bin/base-agent"
+        }"#;
+        let base_profile = parse_profile_bytes(base).expect("parse base");
+        assert_eq!(base_profile.binary.as_deref(), Some("/usr/bin/base-agent"));
+
+        let child = br#"{
+            "meta": { "name": "child" },
+            "binary": "/opt/child-agent"
+        }"#;
+        let child_profile = parse_profile_bytes(child).expect("parse child");
+        assert_eq!(child_profile.binary.as_deref(), Some("/opt/child-agent"));
+
+        let merged = merge_profiles(base_profile, child_profile);
+        assert_eq!(
+            merged.binary.as_deref(),
+            Some("/opt/child-agent"),
+            "child binary should override base"
+        );
+
+        let no_binary = br#"{ "meta": { "name": "no-bin" } }"#;
+        let no_bin_profile = parse_profile_bytes(no_binary).expect("parse no-binary");
+        assert!(no_bin_profile.binary.is_none());
+
+        let base2 =
+            parse_profile_bytes(br#"{ "meta": { "name": "b2" }, "binary": "/usr/bin/inherited" }"#)
+                .expect("parse");
+        let merged2 = merge_profiles(base2, no_bin_profile);
+        assert_eq!(
+            merged2.binary.as_deref(),
+            Some("/usr/bin/inherited"),
+            "child without binary should inherit from base"
         );
     }
 }

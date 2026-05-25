@@ -4,11 +4,13 @@
 //! and passes the path via NONO_CAP_FILE. This allows sandboxed processes
 //! to query their own capabilities using `nono why --self`.
 
-use nono::{AccessMode, CapabilitySet, FsCapability, NonoError, Result};
+#[cfg(target_os = "macos")]
+use crate::capability_ext::new_exact_path_capability;
+use nono::{AccessMode, CapabilitySet, CapabilitySource, FsCapability, NonoError, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::debug;
 
 #[cfg(unix)]
@@ -45,6 +47,9 @@ pub struct FsCapState {
     pub access: String,
     /// Whether this is a single file (vs directory)
     pub is_file: bool,
+    /// Capability source for diagnostics (`user`, `profile`, `group:<name>`, `system`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 impl SandboxState {
@@ -67,6 +72,7 @@ impl SandboxState {
                         AccessMode::ReadWrite => "readwrite".to_string(),
                     },
                     is_file: c.is_file,
+                    source: Some(c.source.to_string()),
                 })
                 .collect(),
             net_blocked: caps.is_network_blocked(),
@@ -90,30 +96,25 @@ impl SandboxState {
 
     /// Convert back to a CapabilitySet
     ///
-    /// Paths are re-validated through the standard constructors which
-    /// canonicalize paths and verify existence. This prevents crafted
-    /// state files from injecting arbitrary paths that bypass validation.
+    /// Paths are re-validated through the standard constructors whenever
+    /// possible. On macOS, exact-file grants for missing leaf paths are
+    /// reconstructed with the same future-file logic used at profile load time.
+    /// In all cases, the reconstructed canonical path must match the path
+    /// serialized in the state file.
     ///
-    /// Returns an error if any path no longer exists or fails validation.
+    /// Returns an error if a stored grant fails validation or if the current
+    /// filesystem state no longer matches the serialized grant.
     pub fn to_caps(&self) -> Result<CapabilitySet> {
         let mut caps = CapabilitySet::new();
 
         for fs_cap in &self.fs {
-            let access = match fs_cap.access.as_str() {
-                "read" => AccessMode::Read,
-                "write" => AccessMode::Write,
-                "readwrite" => AccessMode::ReadWrite,
-                other => {
-                    return Err(NonoError::ConfigParse(format!(
-                        "invalid access mode in sandbox state: {other}"
-                    )));
-                }
-            };
+            let access = parse_access_mode(&fs_cap.access)?;
+            let source = parse_capability_source(fs_cap.source.as_deref())?;
 
             let cap = if fs_cap.is_file {
-                FsCapability::new_file(&fs_cap.original, access)?
+                restore_exact_path_capability(fs_cap, access, &source)?
             } else {
-                FsCapability::new_dir(&fs_cap.original, access)?
+                restore_directory_capability(fs_cap, access, &source)?
             };
             caps.add_fs(cap);
         }
@@ -178,6 +179,84 @@ impl SandboxState {
 
         Ok(())
     }
+}
+
+fn parse_access_mode(access: &str) -> Result<AccessMode> {
+    match access {
+        "read" => Ok(AccessMode::Read),
+        "write" => Ok(AccessMode::Write),
+        "readwrite" => Ok(AccessMode::ReadWrite),
+        other => Err(NonoError::ConfigParse(format!(
+            "invalid access mode in sandbox state: {other}"
+        ))),
+    }
+}
+
+fn parse_capability_source(source: Option<&str>) -> Result<CapabilitySource> {
+    match source {
+        None | Some("") | Some("user") => Ok(CapabilitySource::User),
+        Some("profile") => Ok(CapabilitySource::Profile),
+        Some("system") => Ok(CapabilitySource::System),
+        Some(group) if let Some(name) = group.strip_prefix("group:") => {
+            if name.is_empty() {
+                return Err(NonoError::ConfigParse(
+                    "invalid capability source in sandbox state: empty group name".to_string(),
+                ));
+            }
+            Ok(CapabilitySource::Group(name.to_string()))
+        }
+        Some(other) => Err(NonoError::ConfigParse(format!(
+            "invalid capability source in sandbox state: {other}"
+        ))),
+    }
+}
+
+fn validate_restored_path(fs_cap: &FsCapState, actual: &Path) -> Result<()> {
+    let serialized = Path::new(&fs_cap.path);
+    if actual != serialized {
+        return Err(NonoError::ConfigParse(format!(
+            "sandbox state path drifted at reload: serialized resolved={}, actual resolved={}",
+            serialized.display(),
+            actual.display(),
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn restore_exact_path_capability(
+    fs_cap: &FsCapState,
+    access: AccessMode,
+    source: &CapabilitySource,
+) -> Result<FsCapability> {
+    let mut cap = new_exact_path_capability(Path::new(&fs_cap.original), access)?;
+    validate_restored_path(fs_cap, &cap.resolved)?;
+    cap.source = source.clone();
+    Ok(cap)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn restore_exact_path_capability(
+    fs_cap: &FsCapState,
+    access: AccessMode,
+    source: &CapabilitySource,
+) -> Result<FsCapability> {
+    let mut cap = FsCapability::new_file(&fs_cap.original, access)?;
+    validate_restored_path(fs_cap, &cap.resolved)?;
+    cap.source = source.clone();
+    Ok(cap)
+}
+
+fn restore_directory_capability(
+    fs_cap: &FsCapState,
+    access: AccessMode,
+    source: &CapabilitySource,
+) -> Result<FsCapability> {
+    let mut cap = FsCapability::new_dir(&fs_cap.original, access)?;
+    validate_restored_path(fs_cap, &cap.resolved)?;
+    cap.source = source.clone();
+    Ok(cap)
 }
 
 /// Maximum size for capability state files (1 MB is more than enough)
@@ -370,6 +449,7 @@ pub fn cleanup_stale_state_files() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nono::CapabilitySource;
     use tempfile::tempdir;
 
     #[test]
@@ -404,5 +484,127 @@ mod tests {
         let loaded: SandboxState = serde_json::from_str(&content).expect("Failed to parse state");
 
         assert!(loaded.net_blocked);
+    }
+
+    #[test]
+    fn test_sandbox_state_roundtrip_preserves_source() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("granted.txt");
+        std::fs::write(&file_path, b"ok").expect("write test file");
+
+        let mut cap = FsCapability::new_file(&file_path, AccessMode::Read).expect("create cap");
+        cap.source = CapabilitySource::Group("system_read_macos".to_string());
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(cap);
+
+        let state = SandboxState::from_caps(&caps, &[], &[]);
+        let restored = state.to_caps().expect("restore caps");
+
+        assert_eq!(restored.fs_capabilities().len(), 1);
+        assert_eq!(
+            restored.fs_capabilities()[0].source,
+            CapabilitySource::Group("system_read_macos".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_sandbox_state_restores_missing_future_file() {
+        let dir = tempdir().expect("tempdir");
+        let missing = dir.path().join("future.lock");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: missing.clone(),
+            resolved: dir
+                .path()
+                .canonicalize()
+                .expect("canonicalize dir")
+                .join("future.lock"),
+            access: AccessMode::ReadWrite,
+            is_file: true,
+            source: CapabilitySource::Profile,
+        });
+
+        let state = SandboxState::from_caps(&caps, &[], &[]);
+        let restored = state.to_caps().expect("restore future file cap");
+
+        assert_eq!(restored.fs_capabilities().len(), 1);
+        assert_eq!(restored.fs_capabilities()[0].original, missing);
+        assert_eq!(restored.fs_capabilities()[0].access, AccessMode::ReadWrite);
+        assert_eq!(
+            restored.fs_capabilities()[0].source,
+            CapabilitySource::Profile
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_sandbox_state_restores_exact_directory_literal_path() {
+        let dir = tempdir().expect("tempdir");
+        let lock_dir = dir.path().join("claude.lock");
+        std::fs::create_dir_all(&lock_dir).expect("create lock dir");
+        let child = lock_dir.join("child.txt");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: lock_dir.clone(),
+            resolved: lock_dir.canonicalize().expect("canonicalize lock dir"),
+            access: AccessMode::ReadWrite,
+            is_file: true,
+            source: CapabilitySource::Profile,
+        });
+
+        let state = SandboxState::from_caps(&caps, &[], &[]);
+        let restored = state.to_caps().expect("restore exact directory literal");
+
+        assert_eq!(restored.fs_capabilities().len(), 1);
+        assert_eq!(restored.fs_capabilities()[0].original, lock_dir);
+        assert!(restored.fs_capabilities()[0].is_file);
+        assert_eq!(
+            restored.fs_capabilities()[0].source,
+            CapabilitySource::Profile
+        );
+        assert!(
+            !restored.path_covered(&child),
+            "exact-path directory literal must not recursively cover descendants"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_sandbox_state_rejects_drifted_future_file_path() {
+        let dir = tempdir().expect("tempdir");
+        let missing = dir.path().join("future.lock");
+
+        let state = SandboxState {
+            fs: vec![FsCapState {
+                original: missing.display().to_string(),
+                path: dir
+                    .path()
+                    .canonicalize()
+                    .expect("canonicalize dir")
+                    .join("other.lock")
+                    .display()
+                    .to_string(),
+                access: "readwrite".to_string(),
+                is_file: true,
+                source: Some("profile".to_string()),
+            }],
+            net_blocked: false,
+            allowed_commands: vec![],
+            blocked_commands: vec![],
+            bypass_protection_paths: vec![],
+            allowed_domains: vec![],
+        };
+
+        let err = state
+            .to_caps()
+            .expect_err("drifted future file must be rejected");
+        assert!(
+            format!("{err}").contains("sandbox state path drifted"),
+            "error should mention path drift"
+        );
     }
 }

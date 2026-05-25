@@ -1662,6 +1662,17 @@ pub struct RunArgs {
     #[arg(long, help_heading = "OPTIONS")]
     pub no_diagnostics: bool,
 
+    /// Kill the process if it has not entered alt-screen mode after this many seconds.
+    /// Startup banners and log lines do not count; only a full-screen TUI transition satisfies the check.
+    /// Set to 0 to disable. Env: NONO_STARTUP_TIMEOUT.
+    #[arg(
+        long = "startup-timeout",
+        value_name = "SECS",
+        env = "NONO_STARTUP_TIMEOUT",
+        help_heading = "OPTIONS"
+    )]
+    pub startup_timeout_secs: Option<u64>,
+
     /// Disable the audit trail for this session
     #[arg(
         long,
@@ -1703,8 +1714,8 @@ pub struct RunArgs {
     #[arg(long, env = "NONO_CAPABILITY_ELEVATION", help_heading = "OPTIONS")]
     pub capability_elevation: bool,
 
-    /// Command to run inside the sandbox
-    #[arg(required = true, hide = true)]
+    /// Command to run inside the sandbox (optional if profile specifies `binary`)
+    #[arg(hide = true)]
     pub command: Vec<String>,
 
     /// Print help
@@ -1725,6 +1736,17 @@ pub struct ShellArgs {
     /// Name for this session (shown in `nono ps`)
     #[arg(long, value_name = "NAME", help_heading = "OPTIONS")]
     pub name: Option<String>,
+
+    /// Kill the process if it has not entered alt-screen mode after this many seconds.
+    /// Startup banners and log lines do not count; only a full-screen TUI transition satisfies the check.
+    /// Set to 0 to disable. Env: NONO_STARTUP_TIMEOUT.
+    #[arg(
+        long = "startup-timeout",
+        value_name = "SECS",
+        env = "NONO_STARTUP_TIMEOUT",
+        help_heading = "OPTIONS"
+    )]
+    pub startup_timeout_secs: Option<u64>,
 
     /// Print help
     #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]

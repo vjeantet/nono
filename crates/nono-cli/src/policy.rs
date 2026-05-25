@@ -176,6 +176,7 @@ impl ProfileDef {
             interactive: self.interactive,
             skipdirs: Vec::new(),
             packs: self.packs.clone(),
+            binary: None,
             command_args: self.command_args.clone(),
             unsafe_macos_seatbelt_rules: self.unsafe_macos_seatbelt_rules.clone(),
         }
@@ -1111,17 +1112,12 @@ pub fn validate_deny_overlaps(deny_paths: &[PathBuf], caps: &CapabilitySet) -> R
             }
             // Check if deny path is a child of an allowed directory
             if deny_path.starts_with(&cap.resolved) && *deny_path != cap.resolved {
-                let conflict = format!(
+                fatal_conflicts.push(format!(
                     "deny '{}' overlaps allowed parent '{}' (source: {})",
                     deny_path.display(),
                     cap.resolved.display(),
                     cap.source,
-                );
-                warn!(
-                    "Landlock cannot enforce {}. This deny has no effect on Linux.",
-                    conflict
-                );
-                fatal_conflicts.push(conflict);
+                ));
             }
         }
     }
@@ -1133,25 +1129,27 @@ pub fn validate_deny_overlaps(deny_paths: &[PathBuf], caps: &CapabilitySet) -> R
     fatal_conflicts.sort();
     fatal_conflicts.dedup();
 
+    let count = fatal_conflicts.len();
+    const PREVIEW_LIMIT: usize = 5;
     let preview = fatal_conflicts
         .iter()
-        .take(5)
-        .map(|c| format!("- {}", c))
+        .take(PREVIEW_LIMIT)
+        .map(|conflict| format!("- {conflict}"))
         .collect::<Vec<_>>()
         .join("\n");
 
-    let remainder = fatal_conflicts.len().saturating_sub(5);
+    let remainder = count.saturating_sub(PREVIEW_LIMIT);
     let more = if remainder > 0 {
-        format!("\n- ... and {} more conflict(s)", remainder)
+        format!("\n- ... and {remainder} more conflict(s)")
     } else {
         String::new()
     };
 
     Err(NonoError::SandboxInit(format!(
         "Landlock deny-overlap is not enforceable on Linux. Refusing to start with conflicting policy.\n\
-         Remove the broad allow path, remove the deny path, or restructure permissions.\n\
-         Conflicts:\n{}{}",
-        preview, more
+         {count} deny rule(s) cannot apply under an allowed parent directory.\n\
+         Conflicts:\n{preview}{more}\n\
+         Remove the broad allow path, remove the deny path, or restructure permissions.",
     )))
 }
 
