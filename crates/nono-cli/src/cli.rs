@@ -825,9 +825,9 @@ pub struct OutdatedArgs {
 /// Arguments for the hidden open-url-helper subcommand.
 ///
 /// Invoked as `BROWSER=nono open-url-helper` on Linux, or via the `open`
-/// PATH shim on macOS. Reads `NONO_SUPERVISOR_FD` from the environment,
-/// sends an `OpenUrl` IPC message to the unsandboxed supervisor, and
-/// waits for a response.
+/// PATH shim on macOS. Reads `NONO_SUPERVISOR_PATH` from the environment,
+/// connects to the supervisor's named Unix socket, sends an `OpenUrl` IPC
+/// message, and waits for a response.
 #[derive(Parser, Debug, Clone)]
 pub struct OpenUrlHelperArgs {
     /// The URL to open
