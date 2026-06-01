@@ -52,9 +52,11 @@ jobs:
         with:
           ref: ${{ env.RELEASE_TAG }}
 
+      # rpm is needed for building .rpm release artifacts; libdbus is no longer
+      # required now that the Linux keyring backend is pure-Rust (zbus).
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config rpm
+        run: sudo apt-get update && sudo apt-get install -y pkg-config rpm
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
@@ -72,6 +74,26 @@ jobs:
       - name: Build (cross aarch64-unknown-linux-gnu)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: cross build --release --target aarch64-unknown-linux-gnu -p nono-cli
+
+      # The portable .tar.gz artifacts carry no dependency metadata, so a binary
+      # that links libdbus would fail to start on hosts without it. The Linux
+      # keyring backend is the pure-Rust zbus path; guard against a regression
+      # back to the C Secret Service backend. objdump parses the ELF NEEDED
+      # entries for both native and cross-built (aarch64) binaries.
+      - name: Verify binary does not link libdbus (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/nono"
+          needed="$(objdump -p "$bin" | awk '/NEEDED/ {print $2}')"
+          echo "NEEDED libraries for $bin:"
+          echo "$needed"
+          if echo "$needed" | grep -qi '^libdbus'; then
+            echo "::error::$bin links libdbus — the release binary is not portable"
+            exit 1
+          fi
+          echo "OK: no libdbus dependency"
 
       - name: Package
         shell: bash
@@ -198,9 +220,6 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ env.RELEASE_TAG }}
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
