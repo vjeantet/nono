@@ -54,7 +54,7 @@ curl -fsSL https://nono.sh/install.sh | sh
 brew install nono
 ```
 
-**Other platforms** — Debian/Ubuntu, Fedora, Arch, RHEL, openSUSE, WSL2, and Nix: [see install instructions](https://docs.nono.sh/docs/installation).
+**Other platforms** — Debian/Ubuntu, Fedora, Arch, RHEL, openSUSE, WSL2, and Nix: [see install instructions](https://nono.sh/docs/cli/getting_started/installation).
 
 ## Run it!
 
