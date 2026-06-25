@@ -2630,6 +2630,7 @@ fn load_registry_profile(name_or_path: &str) -> Result<Profile> {
             registry: None,
             force: false,
             init: false,
+            insecure: false,
             help: None,
         })?;
     }
