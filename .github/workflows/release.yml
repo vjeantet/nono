@@ -20,7 +20,7 @@ env:
 
 jobs:
   build:
-    if: github.repository == 'nolabs-ai/nono'
+    if: contains(fromJSON('["nolabs-ai/nono","vjeantet/nono"]'), github.repository)
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
