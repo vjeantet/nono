@@ -29,6 +29,21 @@
 ---
 </div>
 
+> [!IMPORTANT]
+> **This is a fork of [nolabs-ai/nono](https://github.com/nolabs-ai/nono).**
+>
+> It tracks upstream and adds support for distributing packs from a **static, air-gapped internal registry** without Sigstore signature verification, for fleets that cannot reach the public registry. Integrity is still enforced per artifact via SHA-256 and TLS host verification is unchanged - only signature provenance is traded away, and only when explicitly opted in.
+>
+> The fork also ships its own release/CI plumbing (native `aarch64` builds and a dedicated [Homebrew tap](https://github.com/vjeantet/homebrew-tap)).
+>
+> **Install this fork via Homebrew:**
+>
+> ```bash
+> brew install vjeantet/tap/nono
+> ```
+>
+> See the documentation: [Air-Gapped / Internal Registry (Unsigned Packs)](docs/cli/features/managing-packs.mdx#air-gapped--internal-registry-unsigned-packs).
+
 > [!NOTE]
 > In the lead-up to a 1.0 release, APIs are stabilizing. API changes may still occur where necessary, but will be kept to a minimum.
 
