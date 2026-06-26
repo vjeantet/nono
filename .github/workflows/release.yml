@@ -224,8 +224,9 @@ jobs:
     name: Publish to crates.io
     needs: release
     runs-on: ubuntu-latest
-    # Only publish stable releases to crates.io
-    if: ${{ !contains(github.event.inputs.tag || github.ref_name, 'alpha') && !contains(github.event.inputs.tag || github.ref_name, 'beta') && !contains(github.event.inputs.tag || github.ref_name, 'rc') }}
+    # Only publish stable releases to crates.io, and only from upstream (forks
+    # lack the crates.io token and must not publish).
+    if: ${{ github.repository == 'nolabs-ai/nono' && !contains(github.event.inputs.tag || github.ref_name, 'alpha') && !contains(github.event.inputs.tag || github.ref_name, 'beta') && !contains(github.event.inputs.tag || github.ref_name, 'rc') }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -289,7 +290,9 @@ jobs:
     name: Bump Homebrew Core Formula
     needs: release
     runs-on: ubuntu-latest
-    if: ${{ !contains(github.event.inputs.tag || github.ref_name, 'alpha') && !contains(github.event.inputs.tag || github.ref_name, 'beta') && !contains(github.event.inputs.tag || github.ref_name, 'rc') }}
+    # Upstream-only: the homebrew-core formula and its token live with the
+    # canonical repository, not with forks.
+    if: ${{ github.repository == 'nolabs-ai/nono' && !contains(github.event.inputs.tag || github.ref_name, 'alpha') && !contains(github.event.inputs.tag || github.ref_name, 'beta') && !contains(github.event.inputs.tag || github.ref_name, 'rc') }}
     steps:
       - name: Bump homebrew-core formula
         # Pinned to AvesAlight fork (v4.1.1) which accepts any 3xx redirect; revert to mislav once
@@ -306,7 +309,8 @@ jobs:
     name: Notify Downstream Repos
     needs: [release, publish-crates]
     runs-on: ubuntu-latest
-    if: ${{ !contains(github.event.inputs.tag || github.ref_name, 'alpha') && !contains(github.event.inputs.tag || github.ref_name, 'beta') && !contains(github.event.inputs.tag || github.ref_name, 'rc') }}
+    # Upstream-only: downstream repos are notified by the canonical repository.
+    if: ${{ github.repository == 'nolabs-ai/nono' && !contains(github.event.inputs.tag || github.ref_name, 'alpha') && !contains(github.event.inputs.tag || github.ref_name, 'beta') && !contains(github.event.inputs.tag || github.ref_name, 'rc') }}
     strategy:
       fail-fast: false
       matrix:
