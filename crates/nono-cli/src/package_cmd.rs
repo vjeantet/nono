@@ -892,6 +892,50 @@ fn validate_pull_response(package_ref: &PackageRef, pull: &PullResponse) -> Resu
     Ok(())
 }
 
+/// How each downloaded artifact is matched against the verified bundle's signed
+/// subjects, per trust mode. Keeps the per-mode policy explicit and auditable.
+enum SubjectCheck {
+    /// Unsigned install: no subject check (SHA-256 integrity only).
+    None,
+    /// Keyless (Sigstore): the artifact digest must be a signed subject digest.
+    Digest(HashSet<String>),
+    /// Keyed: the artifact's `(filename, digest)` must match a signed subject,
+    /// binding the name to its digest so signed bytes cannot be served under a
+    /// different filename.
+    NameAndDigest(HashSet<(String, String)>),
+}
+
+impl SubjectCheck {
+    /// Check a downloaded artifact against the signed subjects. Returns the
+    /// rejection reason if the artifact is not an accepted signed subject.
+    /// (The caller has already confirmed `digest` matches what the registry
+    /// advertised; this binds it to the *signature*.)
+    fn verify(&self, filename: &str, digest: &str) -> std::result::Result<(), String> {
+        match self {
+            SubjectCheck::None => Ok(()),
+            SubjectCheck::Digest(digests) => {
+                if digests.contains(digest) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "artifact {filename} digest not found in bundle subjects"
+                    ))
+                }
+            }
+            SubjectCheck::NameAndDigest(pairs) => {
+                if pairs.contains(&(filename.to_string(), digest.to_string())) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "artifact {filename} (digest {digest}) does not match any \
+                         signed bundle subject"
+                    ))
+                }
+            }
+        }
+    }
+}
+
 fn download_and_verify_artifacts(
     client: &RegistryClient,
     package_ref: &PackageRef,
@@ -910,7 +954,7 @@ fn download_and_verify_artifacts(
     //   configured ECDSA P-256 public key, binding the signer key_id to the
     //   registry's trusted key fingerprint.
     // - Unsigned: no bundle, no signer; SHA-256 integrity only.
-    let (bundle_json, signer_identity, subject_digests) = match trust {
+    let (bundle_json, signer_identity, subject_check) = match trust {
         TrustMode::Keyless => {
             let trusted_root = nono::trust::load_production_trusted_root()?;
             let policy = nono::trust::VerificationPolicy::default();
@@ -919,7 +963,7 @@ fn download_and_verify_artifacts(
             let bundle = nono::trust::load_bundle_from_str(&bundle_json, bundle_path)?;
 
             let subjects = nono::trust::extract_all_subjects(&bundle, bundle_path)?;
-            let subject_digests: std::collections::HashSet<String> =
+            let subject_digests: HashSet<String> =
                 subjects.iter().map(|(_, digest)| digest.clone()).collect();
 
             if let Some((_, first_digest)) = subjects.first() {
@@ -943,7 +987,7 @@ fn download_and_verify_artifacts(
             (
                 Some(bundle_json),
                 Some(signer_identity),
-                Some(subject_digests),
+                SubjectCheck::Digest(subject_digests),
             )
         }
         TrustMode::Keyed {
@@ -968,8 +1012,22 @@ fn download_and_verify_artifacts(
                     reason: "bundle contains no subjects".to_string(),
                 });
             }
-            let subject_digests: std::collections::HashSet<String> =
-                subjects.iter().map(|(_, digest)| digest.clone()).collect();
+            // Bind each artifact's (name, digest) to a signed subject, not the
+            // digest alone (parity with the runtime keyed re-verification in
+            // `verify_stored_bundles_keyed`): rejects signed bytes served under a
+            // different filename.
+            //
+            // Note: keyed mode does NOT bind the requested namespace/name to the
+            // signed material. A single fleet key signs every pack and the signed
+            // subjects are bare filenames, so an attacker who controls the static
+            // registry mirror (but not the key) can serve a *different but
+            // legitimately fleet-signed* pack under the requested namespace. This
+            // is an accepted property of the keyed trust model: the fleet key is
+            // trusted to sign any pack in the fleet, so the residual risk is
+            // pack-substitution within the fleet, not arbitrary code injection.
+            // Deployments needing per-namespace provenance should use keyless
+            // (Sigstore) signing, where the signer org is bound to the namespace.
+            let subject_pairs: HashSet<(String, String)> = subjects.iter().cloned().collect();
 
             // Verify the DSSE envelope signature against the *configured* key
             // (never anything derived from the bundle itself).
@@ -1001,10 +1059,10 @@ fn download_and_verify_artifacts(
             (
                 Some(bundle_json),
                 Some(signer_identity),
-                Some(subject_digests),
+                SubjectCheck::NameAndDigest(subject_pairs),
             )
         }
-        TrustMode::Unsigned => (None, None, None),
+        TrustMode::Unsigned => (None, None, SubjectCheck::None),
     };
 
     let mut downloads = Vec::with_capacity(pull.artifacts.len());
@@ -1024,17 +1082,12 @@ fn download_and_verify_artifacts(
             });
         }
 
-        // When verifying, also require the digest to be a signed subject of
-        // the bundle. Skipped for unsigned installs.
-        if let Some(subject_digests) = &subject_digests
-            && !subject_digests.contains(digest.as_str())
-        {
+        // When verifying, also require the artifact to be a signed subject of
+        // the bundle, per the active mode's policy. Skipped for unsigned installs.
+        if let Err(reason) = subject_check.verify(&artifact.filename, &digest) {
             return Err(NonoError::PackageVerification {
                 package: package_ref.key(),
-                reason: format!(
-                    "artifact {} digest not found in bundle subjects",
-                    artifact.filename
-                ),
+                reason,
             });
         }
 
@@ -1632,6 +1685,47 @@ fn format_timestamp(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Keyed install-time verification must bind the artifact name to its signed
+    // digest: signed bytes served under a different filename are rejected.
+    #[test]
+    fn keyed_subject_check_binds_name_to_digest() {
+        let mut pairs = HashSet::new();
+        pairs.insert(("helper.sh".to_string(), "aaaa".to_string()));
+        pairs.insert(("package.json".to_string(), "bbbb".to_string()));
+        let check = SubjectCheck::NameAndDigest(pairs);
+
+        // Correct (name, digest) pairs pass.
+        assert!(check.verify("helper.sh", "aaaa").is_ok());
+        assert!(check.verify("package.json", "bbbb").is_ok());
+
+        // A signed digest served under a different filename is rejected.
+        let err = check
+            .verify("evil.sh", "aaaa")
+            .expect_err("digest aaaa under wrong name must be rejected");
+        assert!(
+            err.contains("does not match any signed bundle subject"),
+            "{err}"
+        );
+
+        // A correct name with a non-signed digest is rejected.
+        assert!(check.verify("helper.sh", "cccc").is_err());
+    }
+
+    // Keyless install-time verification is unchanged by the keyed work: it binds
+    // the digest only (the runtime keyless re-verification adds the name check).
+    #[test]
+    fn keyless_subject_check_is_digest_only() {
+        let mut digests = HashSet::new();
+        digests.insert("aaaa".to_string());
+        let check = SubjectCheck::Digest(digests);
+
+        // A signed digest is accepted regardless of filename.
+        assert!(check.verify("helper.sh", "aaaa").is_ok());
+        assert!(check.verify("anything-else", "aaaa").is_ok());
+        // An unsigned digest is rejected.
+        assert!(check.verify("helper.sh", "zzzz").is_err());
+    }
 
     #[test]
     fn compare_versions_honors_prerelease_ordering() {
