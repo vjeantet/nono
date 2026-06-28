@@ -297,11 +297,21 @@ impl Default for UpdateSettings {
 /// Pack registry settings.
 ///
 /// Lets a fleet point `nono pull`/`nono update` at an internal registry and
-/// (for air-gapped, internal-trust deployments) disable Sigstore signature
-/// verification via a single MDM-managed `config.toml`. `verify` defaults to
-/// `true` (fail-secure): signature checks stay on unless explicitly disabled.
-/// Disabling `verify` turns off signature verification only — it does NOT
-/// disable TLS host verification.
+/// choose a trust mode via a single MDM-managed `config.toml`:
+///
+/// - **keyless** (default): Sigstore/Fulcio keyless verification against the
+///   public trusted root. Used for the public registry.
+/// - **keyed**: set `trusted_key` (base64 SPKI DER) or `trusted_key_file`
+///   (a file holding the same base64, or a PEM public key). Packs are verified
+///   offline against this self-managed ECDSA P-256 public key. For air-gapped
+///   enterprise fleets distributing internally signed packs.
+/// - **unsigned**: `verify = false` (or `--insecure` / `NONO_REGISTRY_INSECURE`)
+///   skips signature verification entirely, keeping SHA-256 integrity only.
+///
+/// `verify` defaults to `true` (fail-secure). None of these modes disable TLS
+/// host verification. A configured `trusted_key`/`trusted_key_file` cannot be
+/// silently downgraded: combining it with `verify = false` is a hard error and
+/// `NONO_REGISTRY_INSECURE` is ignored (see `resolve_registry`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct RegistrySettings {
     /// Default registry base URL. Lower precedence than `--registry` and the
@@ -311,6 +321,16 @@ pub struct RegistrySettings {
     /// Whether to verify pack signatures (default: true).
     #[serde(default = "default_true")]
     pub verify: bool,
+    /// Trusted keyed-signing public key, base64 SPKI (DER). Inline, MDM-friendly.
+    /// Its presence selects the keyed trust mode. Mutually exclusive with
+    /// `trusted_key_file`.
+    #[serde(default)]
+    pub trusted_key: Option<String>,
+    /// Path to a file holding the trusted keyed-signing public key, either the
+    /// same base64 SPKI as `trusted_key` or a PEM public key. MDM-pushed.
+    /// Mutually exclusive with `trusted_key`.
+    #[serde(default)]
+    pub trusted_key_file: Option<String>,
 }
 
 impl Default for RegistrySettings {
@@ -318,6 +338,8 @@ impl Default for RegistrySettings {
         Self {
             url: None,
             verify: default_true(),
+            trusted_key: None,
+            trusted_key_file: None,
         }
     }
 }
