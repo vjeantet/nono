@@ -1,7 +1,7 @@
 use crate::cli::SandboxArgs;
 use crate::{package, profile};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub(crate) struct PreparedProfile {
@@ -223,9 +223,21 @@ fn verify_profile_packs(packs: &[String], profile: &profile::Profile) -> crate::
         // against a self-managed public key resolved offline from the pinned
         // fingerprint; keyless packs re-verify against the Sigstore root.
         if let Some(fingerprint) = pinned_signer.strip_prefix("keyed:") {
-            verify_stored_bundles_keyed(&install_dir, &bundle_path, pack_ref, fingerprint)?;
+            verify_stored_bundles_keyed(
+                &install_dir,
+                &bundle_path,
+                pack_ref,
+                fingerprint,
+                &locked_pkg.artifacts,
+            )?;
         } else {
-            verify_stored_bundles(&install_dir, &bundle_path, pack_ref, Some(pinned_signer))?;
+            verify_stored_bundles(
+                &install_dir,
+                &bundle_path,
+                pack_ref,
+                Some(pinned_signer),
+                &locked_pkg.artifacts,
+            )?;
         }
     }
 
@@ -236,12 +248,45 @@ fn canonical_signer(uri: &str) -> &str {
     uri.rsplit_once('@').map_or(uri, |(prefix, _)| prefix)
 }
 
+/// Ensure every installed artifact recorded in the lockfile was covered by a
+/// signature-verified bundle entry.
+///
+/// The re-verification loops are driven by the on-disk `.nono-trust.bundle`, so
+/// an artifact only gets a signature check if it has a matching entry. The
+/// lockfile and the bundle are both attacker-mutable, but the bundle's
+/// signatures are not forgeable. Without this cross-check, deleting an entry
+/// (or emptying the bundle to `[]`) would silently skip all signature checks
+/// for that artifact while the mutable lockfile SHA-256 still passed - letting
+/// tampered code run undetected. The lockfile artifact set is the right set to
+/// enforce: session hooks must be declared lockfile artifacts, and at install
+/// time every lockfile artifact is written with a matching bundle entry.
+fn ensure_all_artifacts_covered(
+    locked_artifacts: &std::collections::BTreeMap<String, package::LockedArtifact>,
+    verified_paths: &HashSet<&str>,
+    pack_ref: &str,
+) -> crate::Result<()> {
+    for installed_path in locked_artifacts.keys() {
+        if !verified_paths.contains(installed_path.as_str()) {
+            return Err(nono::NonoError::PackageVerification {
+                package: pack_ref.to_string(),
+                reason: format!(
+                    "pack '{}' artifact '{}' is not covered by a signed trust bundle entry \
+                     (entry missing or removed). Reinstall with: nono pull {} --force",
+                    pack_ref, installed_path, pack_ref
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Re-verify each artifact's Sigstore bundle from the stored trust bundle file.
 fn verify_stored_bundles(
     install_dir: &Path,
     bundle_path: &Path,
     pack_ref: &str,
     pinned_signer: Option<&str>,
+    locked_artifacts: &std::collections::BTreeMap<String, package::LockedArtifact>,
 ) -> crate::Result<()> {
     let bundle_content = std::fs::read_to_string(bundle_path).map_err(|e| {
         nono::NonoError::PackageInstall(format!(
@@ -259,6 +304,10 @@ fn verify_stored_bundles(
 
     let trusted_root = nono::trust::load_production_trusted_root()?;
     let policy = nono::trust::VerificationPolicy::default();
+
+    // installed_path of every entry that fully verified; cross-checked against
+    // the lockfile below so a removed entry cannot skip an artifact's signature.
+    let mut verified_paths: HashSet<&str> = HashSet::new();
 
     for entry in &entries {
         let artifact_name = entry
@@ -376,9 +425,11 @@ fn verify_stored_bundles(
                 });
             }
         }
+
+        verified_paths.insert(installed_path);
     }
 
-    Ok(())
+    ensure_all_artifacts_covered(locked_artifacts, &verified_paths, pack_ref)
 }
 
 /// Resolve a keyed pack's trusted public key (SPKI DER) offline, by its pinned
@@ -433,6 +484,7 @@ fn verify_stored_bundles_keyed(
     bundle_path: &Path,
     pack_ref: &str,
     fingerprint: &str,
+    locked_artifacts: &std::collections::BTreeMap<String, package::LockedArtifact>,
 ) -> crate::Result<()> {
     let spki_der = resolve_trusted_key_der(fingerprint, pack_ref)?;
 
@@ -448,6 +500,10 @@ fn verify_stored_bundles_keyed(
             pack_ref, e
         ))
     })?;
+
+    // installed_path of every entry that fully verified; cross-checked against
+    // the lockfile below so a removed entry cannot skip an artifact's signature.
+    let mut verified_paths: HashSet<&str> = HashSet::new();
 
     for entry in &entries {
         let artifact_name = entry
@@ -574,9 +630,11 @@ fn verify_stored_bundles_keyed(
                 });
             }
         }
+
+        verified_paths.insert(installed_path);
     }
 
-    Ok(())
+    ensure_all_artifacts_covered(locked_artifacts, &verified_paths, pack_ref)
 }
 
 fn validate_bundle_relative_path<'a>(
@@ -1828,6 +1886,82 @@ mod tests {
         };
         assert!(
             err.to_string().contains("tampered"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // An attacker deletes an artifact's entry from the signed `.nono-trust.bundle`
+    // (the keyed re-verification iterates only bundle entries) and rewrites the
+    // mutable lockfile digest in lockstep so the outer SHA-256 check passes. The
+    // tampered artifact would then face no signature check. Every lockfile
+    // artifact must be covered by a verified signed entry.
+    #[test]
+    fn verify_profile_packs_keyed_rejects_dropped_bundle_entry() {
+        let result = with_config_env(|config_dir| {
+            let (install_dir, fp, pub_b64) = build_keyed_pack(
+                config_dir,
+                "acme",
+                "widget",
+                &[
+                    ("package.json", r#"{"meta":{"name":"widget"}}"#),
+                    ("helper.sh", "echo hello\n"),
+                ],
+            );
+            drop_trusted_key(config_dir, &fp, &pub_b64);
+
+            // Tamper helper.sh and rewrite its lockfile digest in lockstep; leave
+            // package.json valid and signed.
+            let malicious = b"echo pwned\n";
+            fs::write(install_dir.join("helper.sh"), malicious).expect("tamper file");
+            let hex = |bytes: &[u8]| {
+                Sha256::digest(bytes)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            };
+            let pkg_bytes = fs::read(install_dir.join("package.json")).expect("read pkg");
+            let mut artifacts = BTreeMap::new();
+            artifacts.insert(
+                "package.json".to_string(),
+                package::LockedArtifact {
+                    sha256: hex(&pkg_bytes),
+                    artifact_type: package::ArtifactType::Profile,
+                },
+            );
+            artifacts.insert(
+                "helper.sh".to_string(),
+                package::LockedArtifact {
+                    sha256: hex(malicious),
+                    artifact_type: package::ArtifactType::Plugin,
+                },
+            );
+            write_keyed_lockfile(config_dir, "acme/widget", &fp, artifacts);
+
+            // Delete helper.sh's entry from the signed bundle so the keyed loop
+            // never iterates over it.
+            let bundle_path = install_dir.join(".nono-trust.bundle");
+            let entries: Vec<serde_json::Value> =
+                serde_json::from_str(&fs::read_to_string(&bundle_path).expect("read bundle"))
+                    .expect("parse bundle");
+            let kept: Vec<serde_json::Value> = entries
+                .into_iter()
+                .filter(|e| e.get("artifact").and_then(|v| v.as_str()) != Some("helper.sh"))
+                .collect();
+            fs::write(
+                &bundle_path,
+                serde_json::to_string_pretty(&kept).expect("serialize bundle"),
+            )
+            .expect("write bundle");
+
+            verify_profile_packs(&["acme/widget".to_string()], &profile::Profile::default())
+        });
+        let err = match result {
+            Ok(()) => panic!("dropped bundle entry must fail keyed verification"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("not covered by a signed trust bundle entry"),
             "unexpected error: {err}"
         );
     }
