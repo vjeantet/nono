@@ -8,7 +8,7 @@ use crate::package::{
     self, ArtifactEntry, ArtifactType, LockedArtifact, LockedPackage, PackageManifest,
     PackageProvenance, PackageRef, PullArtifact, PullResponse,
 };
-use crate::registry_client::{RegistryClient, resolve_registry, resolve_registry_url};
+use crate::registry_client::{RegistryClient, TrustMode, resolve_registry, resolve_registry_url};
 use chrono::{DateTime, Local, Utc};
 use nono::{NonoError, Result, SignerIdentity};
 use semver::Version;
@@ -21,7 +21,7 @@ use tempfile::TempDir;
 pub fn run_pull(args: PullArgs) -> Result<()> {
     let package_ref = package::parse_package_ref(&args.package_ref)?;
     let config = crate::config::user::load_user_config()?;
-    let reg = resolve_registry(args.registry.as_deref(), args.insecure, config.as_ref());
+    let reg = resolve_registry(args.registry.as_deref(), args.insecure, config.as_ref())?;
     let registry_url = reg.url.clone();
     let client = RegistryClient::new(registry_url.clone());
 
@@ -46,7 +46,7 @@ pub fn run_pull(args: PullArgs) -> Result<()> {
     printer.header(&package_ref);
 
     let downloads =
-        download_and_verify_artifacts(&client, &package_ref, &pull, reg.verify, Some(&printer))?;
+        download_and_verify_artifacts(&client, &package_ref, &pull, &reg.trust, Some(&printer))?;
     let manifest = load_manifest(&downloads.artifacts)?;
     validate_manifest(&manifest)?;
 
@@ -150,11 +150,18 @@ pub fn run_pack(args: PackCmdArgs) -> Result<()> {
 /// <out>/files/<ns>/<name>/<version>/<filename>                # artifact bytes
 /// ```
 ///
-/// The emitted `PullResponse` omits Sigstore provenance and the bundle URL: the
-/// resulting packs are installed with `--insecure` / `[registry].verify=false`,
-/// integrity guaranteed by per-artifact SHA-256. Re-running for a new version
-/// is additive; the `latest` alias and `status` always point at the highest
-/// semver published under the pack.
+/// Without `--keyref`, the emitted `PullResponse` omits provenance and the
+/// bundle URL: the resulting packs are installed unsigned (`--insecure` /
+/// `[registry].verify=false`), integrity guaranteed by per-artifact SHA-256.
+///
+/// With `--keyref`, the artifacts are signed with a keyed ECDSA P-256 key; a
+/// multi-subject bundle is written to `<out>/files/<ns>/<name>/<version>/bundle`
+/// and the `PullResponse` points `bundle_url` at it. Such packs install in the
+/// keyed trust mode (`[registry].trusted_key`), verified offline against the
+/// matching public key. Signing needs no network (no Sigstore/Rekor).
+///
+/// Re-running for a new version is additive; the `latest` alias and `status`
+/// always point at the highest semver published under the pack.
 fn run_pack_publish_static(args: PackPublishStaticArgs) -> Result<()> {
     let package_ref = package::parse_package_ref(&args.package_ref)?;
     if package_ref.version.is_some() {
@@ -237,13 +244,37 @@ fn run_pack_publish_static(args: PackPublishStaticArgs) -> Result<()> {
         });
     }
 
+    // Optionally sign the artifacts with a keyed ECDSA P-256 key, emitting a
+    // bundle into the static tree. The signer key_id is the public-key
+    // fingerprint (stable and bindable by verifiers) rather than the keyref
+    // string, so verifiers can pin `keyed:<fingerprint>` without leaking the
+    // signing key's path. Subject names are the registry filenames so the
+    // runtime re-verification (`verify_stored_bundles_keyed`) matches them.
+    let bundle_url = if let Some(keyref) = args.keyref.as_deref() {
+        let key_ref = crate::trust_keystore::TrustKeyRef::resolve_key(Some(keyref), None)?;
+        let key_pair = crate::trust_cmd::load_signing_key_for_ref(&key_ref)?;
+        let fingerprint = nono::trust::key_id_hex(&key_pair)?;
+        let files: Vec<(PathBuf, String)> = pull_artifacts
+            .iter()
+            .map(|a| (PathBuf::from(&a.filename), a.sha256_digest.clone()))
+            .collect();
+        let bundle_json = nono::trust::sign_files(&files, &key_pair, &fingerprint)?;
+        write_file(&files_root.join("bundle"), bundle_json.as_bytes())?;
+        format!(
+            "{base_path}/files/{}/{}/{version}/bundle",
+            package_ref.namespace, package_ref.name
+        )
+    } else {
+        String::new()
+    };
+
     let pull = PullResponse {
         namespace: package_ref.namespace.clone(),
         name: package_ref.name.clone(),
         version: version.clone(),
         provenance: None,
         artifacts: pull_artifacts,
-        bundle_url: String::new(),
+        bundle_url,
         scan_passed: true,
     };
 
@@ -278,11 +309,17 @@ fn run_pack_publish_static(args: PackPublishStaticArgs) -> Result<()> {
         .join("status");
     write_file(&status_path, status_json.as_bytes())?;
 
+    let signing = if args.keyref.is_some() {
+        "keyed-signed"
+    } else {
+        "unsigned"
+    };
     eprintln!(
-        "  published {} {} ({} artifact(s)) — latest: {}",
+        "  published {} {} ({} artifact(s), {}) — latest: {}",
         package_ref.key(),
         version,
         filenames.len(),
+        signing,
         latest
     );
     eprintln!("  docroot: {}", args.out.display());
@@ -448,7 +485,7 @@ pub fn run_update(args: UpdateArgs) -> Result<()> {
     }
 
     let config = crate::config::user::load_user_config()?;
-    let reg = resolve_registry(args.registry.as_deref(), args.insecure, config.as_ref());
+    let reg = resolve_registry(args.registry.as_deref(), args.insecure, config.as_ref())?;
     let registry_url = reg.url.clone();
     let client = RegistryClient::new(registry_url.clone());
 
@@ -716,7 +753,7 @@ pub fn run_outdated(args: OutdatedArgs) -> Result<()> {
     }
 
     let config = crate::config::user::load_user_config()?;
-    let registry_url = resolve_registry(args.registry.as_deref(), false, config.as_ref()).url;
+    let registry_url = resolve_registry(args.registry.as_deref(), false, config.as_ref())?.url;
     let client = RegistryClient::new(registry_url);
 
     let mut entries: Vec<OutdatedEntry> = Vec::new();
@@ -859,52 +896,115 @@ fn download_and_verify_artifacts(
     client: &RegistryClient,
     package_ref: &PackageRef,
     pull: &PullResponse,
-    verify: bool,
+    trust: &TrustMode,
     printer: Option<&crate::pull_ui::ProgressPrinter>,
 ) -> Result<VerifiedDownloads> {
     let bundle_path = Path::new(".nono-trust.bundle");
     let tempdir = TempDir::new().map_err(NonoError::Io)?;
 
-    // When verification is enabled, download the single multi-subject bundle,
-    // verify its signature against the embedded Sigstore root, and build the
-    // set of trusted subject digests. When disabled (internal/air-gapped
-    // registry), skip all of this — there is no bundle and no signer.
-    let (bundle_json, signer_identity, subject_digests) = if verify {
-        let trusted_root = nono::trust::load_production_trusted_root()?;
-        let policy = nono::trust::VerificationPolicy::default();
+    // Resolve the bundle, signer identity, and trusted subject digests for the
+    // active trust mode:
+    // - Keyless: download + verify the Sigstore bundle against the public root,
+    //   then assert the signer org matches the namespace.
+    // - Keyed: download + verify the bundle's DSSE signature against the
+    //   configured ECDSA P-256 public key, binding the signer key_id to the
+    //   registry's trusted key fingerprint.
+    // - Unsigned: no bundle, no signer; SHA-256 integrity only.
+    let (bundle_json, signer_identity, subject_digests) = match trust {
+        TrustMode::Keyless => {
+            let trusted_root = nono::trust::load_production_trusted_root()?;
+            let policy = nono::trust::VerificationPolicy::default();
 
-        let bundle_json = client.download_bundle(&pull.bundle_url)?;
-        let bundle = nono::trust::load_bundle_from_str(&bundle_json, bundle_path)?;
+            let bundle_json = client.download_bundle(&pull.bundle_url)?;
+            let bundle = nono::trust::load_bundle_from_str(&bundle_json, bundle_path)?;
 
-        let subjects = nono::trust::extract_all_subjects(&bundle, bundle_path)?;
-        let subject_digests: std::collections::HashSet<String> =
-            subjects.iter().map(|(_, digest)| digest.clone()).collect();
+            let subjects = nono::trust::extract_all_subjects(&bundle, bundle_path)?;
+            let subject_digests: std::collections::HashSet<String> =
+                subjects.iter().map(|(_, digest)| digest.clone()).collect();
 
-        if let Some((_, first_digest)) = subjects.first() {
-            nono::trust::verify_bundle_with_digest(
-                first_digest,
-                &bundle,
-                &trusted_root,
-                &policy,
-                bundle_path,
-            )?;
-        } else {
-            return Err(NonoError::PackageVerification {
-                package: package_ref.key(),
-                reason: "bundle contains no subjects".to_string(),
-            });
+            if let Some((_, first_digest)) = subjects.first() {
+                nono::trust::verify_bundle_with_digest(
+                    first_digest,
+                    &bundle,
+                    &trusted_root,
+                    &policy,
+                    bundle_path,
+                )?;
+            } else {
+                return Err(NonoError::PackageVerification {
+                    package: package_ref.key(),
+                    reason: "bundle contains no subjects".to_string(),
+                });
+            }
+
+            let signer_identity = nono::trust::extract_signer_identity(&bundle, bundle_path)?;
+            enforce_namespace_assertion(package_ref, &signer_identity)?;
+
+            (
+                Some(bundle_json),
+                Some(signer_identity),
+                Some(subject_digests),
+            )
         }
+        TrustMode::Keyed {
+            spki_der,
+            fingerprint,
+        } => {
+            // Fail-secure: a keyed registry must serve a signature bundle.
+            if pull.bundle_url.is_empty() {
+                return Err(NonoError::PackageVerification {
+                    package: package_ref.key(),
+                    reason: "keyed registry served no signature bundle (empty bundle_url)"
+                        .to_string(),
+                });
+            }
+            let bundle_json = client.download_bundle(&pull.bundle_url)?;
+            let bundle = nono::trust::load_bundle_from_str(&bundle_json, bundle_path)?;
 
-        let signer_identity = nono::trust::extract_signer_identity(&bundle, bundle_path)?;
-        enforce_namespace_assertion(package_ref, &signer_identity)?;
+            let subjects = nono::trust::extract_all_subjects(&bundle, bundle_path)?;
+            if subjects.is_empty() {
+                return Err(NonoError::PackageVerification {
+                    package: package_ref.key(),
+                    reason: "bundle contains no subjects".to_string(),
+                });
+            }
+            let subject_digests: std::collections::HashSet<String> =
+                subjects.iter().map(|(_, digest)| digest.clone()).collect();
 
-        (
-            Some(bundle_json),
-            Some(signer_identity),
-            Some(subject_digests),
-        )
-    } else {
-        (None, None, None)
+            // Verify the DSSE envelope signature against the *configured* key
+            // (never anything derived from the bundle itself).
+            nono::trust::verify_keyed_signature(&bundle, spki_der, bundle_path)?;
+
+            // Bind the signer identity to the registry's trusted key: the bundle
+            // must be keyed and its key_id must equal the configured fingerprint.
+            // This rejects a valid-but-wrong-key signature.
+            let signer_identity = nono::trust::extract_signer_identity(&bundle, bundle_path)?;
+            match &signer_identity {
+                SignerIdentity::Keyed { key_id } if key_id == fingerprint => {}
+                SignerIdentity::Keyed { key_id } => {
+                    return Err(NonoError::PackageVerification {
+                        package: package_ref.key(),
+                        reason: format!(
+                            "pack signed by key {key_id}, but the registry trusted key is \
+                             {fingerprint}"
+                        ),
+                    });
+                }
+                SignerIdentity::Keyless { .. } => {
+                    return Err(NonoError::PackageVerification {
+                        package: package_ref.key(),
+                        reason: "keyed registry returned a keyless (Sigstore) bundle".to_string(),
+                    });
+                }
+            }
+
+            (
+                Some(bundle_json),
+                Some(signer_identity),
+                Some(subject_digests),
+            )
+        }
+        TrustMode::Unsigned => (None, None, None),
     };
 
     let mut downloads = Vec::with_capacity(pull.artifacts.len());
@@ -1558,6 +1658,7 @@ mod tests {
             out: out.to_path_buf(),
             base_path: None,
             version: None,
+            keyref: None,
             help: None,
         })
         .expect("publish-static");
@@ -1626,5 +1727,116 @@ mod tests {
         )
         .expect("parse latest");
         assert_eq!(latest.version, "1.0.2");
+    }
+
+    /// Write a base64 PKCS#8 ECDSA P-256 private key (the on-disk format a
+    /// `file://` keyref expects) and return the `file://` URI.
+    fn write_signing_key(path: &Path) -> String {
+        use aws_lc_rs::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair};
+        let rng = aws_lc_rs::rand::SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)
+            .expect("generate pkcs8");
+        let b64 = nono::trust::base64::base64_encode(pkcs8.as_ref());
+        fs::write(path, b64).expect("write key");
+        format!("file://{}", path.display())
+    }
+
+    fn publish_keyed(pack_dir: &Path, out: &Path, keyref: &str) {
+        run_pack_publish_static(PackPublishStaticArgs {
+            package_ref: "acme/widget".to_string(),
+            pack_dir: pack_dir.to_path_buf(),
+            out: out.to_path_buf(),
+            base_path: None,
+            version: None,
+            keyref: Some(keyref.to_string()),
+            help: None,
+        })
+        .expect("publish-static keyed");
+    }
+
+    #[test]
+    fn publish_static_keyed_signs_and_verifies() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let pack_dir = tmp.path().join("pack");
+        write_pack(&pack_dir, "1.0.0");
+        let out = tmp.path().join("registry");
+
+        let key_path = tmp.path().join("key.pem");
+        let keyref = write_signing_key(&key_path);
+        publish_keyed(&pack_dir, &out, &keyref);
+
+        // The pull response advertises the emitted bundle.
+        let pull: PullResponse = serde_json::from_slice(
+            &fs::read(out.join("api/v1/packages/acme/widget/versions/1.0.0/pull"))
+                .expect("read pull"),
+        )
+        .expect("parse pull");
+        assert!(
+            !pull.bundle_url.is_empty(),
+            "keyed publish must set bundle_url"
+        );
+        let bundle_file = out.join(pull.bundle_url.trim_start_matches('/'));
+        assert!(bundle_file.exists(), "bundle must be written into the tree");
+
+        // Recover the signing key's public key + fingerprint.
+        let key_ref = crate::trust_keystore::TrustKeyRef::resolve_key(Some(&keyref), None)
+            .expect("resolve keyref");
+        let key_pair = crate::trust_cmd::load_signing_key_for_ref(&key_ref).expect("load key");
+        let spki = nono::trust::export_public_key(&key_pair).expect("pub");
+        let fingerprint = nono::trust::key_id_hex(&key_pair).expect("fingerprint");
+
+        // The bundle verifies against the public key, its signer identity is the
+        // fingerprint, and every advertised artifact is a signed subject.
+        let bundle_json = fs::read_to_string(&bundle_file).expect("read bundle");
+        let bpath = Path::new("bundle");
+        let bundle = nono::trust::load_bundle_from_str(&bundle_json, bpath).expect("load bundle");
+        nono::trust::verify_keyed_signature(&bundle, spki.as_bytes(), bpath)
+            .expect("keyed verification");
+
+        match nono::trust::extract_signer_identity(&bundle, bpath).expect("identity") {
+            nono::trust::SignerIdentity::Keyed { key_id } => assert_eq!(key_id, fingerprint),
+            other => panic!("expected keyed identity, got {other:?}"),
+        }
+
+        let subjects = nono::trust::extract_all_subjects(&bundle, bpath).expect("subjects");
+        for art in &pull.artifacts {
+            assert!(
+                subjects
+                    .iter()
+                    .any(|(name, digest)| name == &art.filename && digest == &art.sha256_digest),
+                "artifact {} is not a signed subject",
+                art.filename
+            );
+        }
+    }
+
+    #[test]
+    fn publish_static_keyed_rejects_wrong_key() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let pack_dir = tmp.path().join("pack");
+        write_pack(&pack_dir, "1.0.0");
+        let out = tmp.path().join("registry");
+
+        let key_path = tmp.path().join("key.pem");
+        let keyref = write_signing_key(&key_path);
+        publish_keyed(&pack_dir, &out, &keyref);
+
+        let pull: PullResponse = serde_json::from_slice(
+            &fs::read(out.join("api/v1/packages/acme/widget/versions/1.0.0/pull"))
+                .expect("read pull"),
+        )
+        .expect("parse pull");
+        let bundle_file = out.join(pull.bundle_url.trim_start_matches('/'));
+        let bundle_json = fs::read_to_string(&bundle_file).expect("read bundle");
+        let bpath = Path::new("bundle");
+        let bundle = nono::trust::load_bundle_from_str(&bundle_json, bpath).expect("load bundle");
+
+        // A different key must not verify the bundle.
+        let other = nono::trust::generate_signing_key().expect("other key");
+        let other_pub = nono::trust::export_public_key(&other).expect("other pub");
+        assert!(
+            nono::trust::verify_keyed_signature(&bundle, other_pub.as_bytes(), bpath).is_err(),
+            "verification with the wrong key must fail"
+        );
     }
 }

@@ -771,6 +771,12 @@ pub struct PackPublishStaticArgs {
     #[arg(long, value_name = "VERSION", help_heading = "OPTIONS")]
     pub version: Option<String>,
 
+    /// Sign artifacts with a keyed ECDSA P-256 key, emitting a bundle into the
+    /// static tree (`keystore://<name>` or `file:///absolute/path`). Without
+    /// this, packs are published unsigned (SHA-256 integrity only).
+    #[arg(long, value_name = "URI", help_heading = "OPTIONS")]
+    pub keyref: Option<String>,
+
     /// Print help
     #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
     pub help: Option<bool>,

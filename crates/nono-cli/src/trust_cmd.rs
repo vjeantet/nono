@@ -1252,7 +1252,7 @@ fn load_public_key_bytes_for_ref(key_ref: &TrustKeyRef) -> Result<Vec<u8>> {
 }
 
 /// Load signing key for a given key reference.
-fn load_signing_key_for_ref(key_ref: &TrustKeyRef) -> Result<trust::KeyPair> {
+pub(crate) fn load_signing_key_for_ref(key_ref: &TrustKeyRef) -> Result<trust::KeyPair> {
     match key_ref {
         TrustKeyRef::Keystore(name) => load_signing_key(name),
         TrustKeyRef::File(path) => {

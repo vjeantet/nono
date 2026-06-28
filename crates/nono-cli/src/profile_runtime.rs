@@ -218,7 +218,15 @@ fn verify_profile_packs(packs: &[String], profile: &profile::Profile) -> crate::
                 pack_ref, pack_ref
             ),
         })?;
-        verify_stored_bundles(&install_dir, &bundle_path, pack_ref, Some(pinned_signer))?;
+
+        // Keyed packs (installed from an enterprise keyed registry) re-verify
+        // against a self-managed public key resolved offline from the pinned
+        // fingerprint; keyless packs re-verify against the Sigstore root.
+        if let Some(fingerprint) = pinned_signer.strip_prefix("keyed:") {
+            verify_stored_bundles_keyed(&install_dir, &bundle_path, pack_ref, fingerprint)?;
+        } else {
+            verify_stored_bundles(&install_dir, &bundle_path, pack_ref, Some(pinned_signer))?;
+        }
     }
 
     Ok(())
@@ -364,6 +372,204 @@ fn verify_stored_bundles(
                         "signer identity mismatch for '{}': bundle was signed by '{}' \
                          but lockfile pins '{}'. Reinstall with: nono pull {} --force",
                         artifact_name, verified_uri, pinned, pack_ref
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Resolve a keyed pack's trusted public key (SPKI DER) offline, by its pinned
+/// fingerprint. Sources, in order: the `[registry]` trusted key in config, then
+/// `~/.config/nono/trusted-keys/<fingerprint>.{pem,b64}`. Fail-secure: returns
+/// an error if no matching key is found (never falls back to SHA-256 only).
+fn resolve_trusted_key_der(fingerprint: &str, pack_ref: &str) -> crate::Result<Vec<u8>> {
+    let config = crate::config::user::load_user_config()?;
+    if let Some((der, fp)) = crate::registry_client::configured_trusted_key(config.as_ref())?
+        && fp == fingerprint
+    {
+        return Ok(der);
+    }
+
+    let dir = crate::config::user::user_trusted_keys_dir()?;
+    for ext in ["pem", "b64"] {
+        let path = dir.join(format!("{fingerprint}.{ext}"));
+        if path.exists() {
+            let content = std::fs::read_to_string(&path).map_err(|e| {
+                nono::NonoError::PackageInstall(format!(
+                    "failed to read trusted key '{}' for pack '{}': {}",
+                    path.display(),
+                    pack_ref,
+                    e
+                ))
+            })?;
+            let der = crate::registry_client::decode_spki_maybe_pem(&content)?;
+            if nono::trust::public_key_id_hex(&der) == fingerprint {
+                return Ok(der);
+            }
+        }
+    }
+
+    Err(nono::NonoError::PackageVerification {
+        package: pack_ref.to_string(),
+        reason: format!(
+            "no trusted key for keyed pack signer 'keyed:{fingerprint}' is available offline. \
+             Set [registry].trusted_key(_file) in config.toml, or drop the public key at \
+             ~/.config/nono/trusted-keys/{fingerprint}.pem"
+        ),
+    })
+}
+
+/// Re-verify each artifact against the stored keyed bundle, using a self-managed
+/// ECDSA P-256 public key resolved offline from the pinned `fingerprint`.
+///
+/// Mirrors [`verify_stored_bundles`] but replaces Sigstore keyless verification
+/// with [`nono::trust::verify_keyed_signature`] against the trusted key, and
+/// binds the bundle's signer `key_id` to the pinned fingerprint.
+fn verify_stored_bundles_keyed(
+    install_dir: &Path,
+    bundle_path: &Path,
+    pack_ref: &str,
+    fingerprint: &str,
+) -> crate::Result<()> {
+    let spki_der = resolve_trusted_key_der(fingerprint, pack_ref)?;
+
+    let bundle_content = std::fs::read_to_string(bundle_path).map_err(|e| {
+        nono::NonoError::PackageInstall(format!(
+            "failed to read trust bundle for pack '{}': {}",
+            pack_ref, e
+        ))
+    })?;
+    let entries: Vec<serde_json::Value> = serde_json::from_str(&bundle_content).map_err(|e| {
+        nono::NonoError::PackageInstall(format!(
+            "failed to parse trust bundle for pack '{}': {}",
+            pack_ref, e
+        ))
+    })?;
+
+    for entry in &entries {
+        let artifact_name = entry
+            .get("artifact")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                nono::NonoError::PackageInstall(format!(
+                    "trust bundle entry missing 'artifact' field in pack '{}'",
+                    pack_ref
+                ))
+            })?;
+        let installed_path = entry
+            .get("installed_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or(artifact_name);
+        let bundle_value = entry.get("bundle").ok_or_else(|| {
+            nono::NonoError::PackageInstall(format!(
+                "trust bundle entry missing 'bundle' field for '{}' in pack '{}'",
+                artifact_name, pack_ref
+            ))
+        })?;
+        let expected_digest = entry
+            .get("digest")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                nono::NonoError::PackageInstall(format!(
+                    "trust bundle entry missing 'digest' field for '{}' in pack '{}'",
+                    artifact_name, pack_ref
+                ))
+            })?;
+
+        let artifact_path = install_dir.join(validate_bundle_relative_path(
+            installed_path,
+            artifact_name,
+            pack_ref,
+        )?);
+        if !artifact_path.exists() {
+            continue;
+        }
+
+        // Bind the *actual* on-disk artifact to the signed digest. Mirrors the
+        // keyless path, where `verify_bundle` hashes the file bytes and checks
+        // them against the bundle's signed subjects. Without this, the file is
+        // only tied to the mutable lockfile digest while the signed
+        // `expected_digest` is bound separately to the bundle — leaving a gap
+        // where tampering the artifact and the lockfile in lockstep (without
+        // the signing key) would pass both checks.
+        let artifact_bytes = std::fs::read(&artifact_path).map_err(|e| {
+            nono::NonoError::PackageInstall(format!(
+                "failed to read '{}' for keyed verification in pack '{}': {}",
+                artifact_name, pack_ref, e
+            ))
+        })?;
+        let actual_digest = {
+            let digest = Sha256::digest(&artifact_bytes);
+            digest
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        if actual_digest != expected_digest {
+            return Err(nono::NonoError::PackageInstall(format!(
+                "pack '{}' artifact '{}' has been tampered with.\n\
+                 Expected: {}\n\
+                 Found:    {}\n\
+                 Reinstall with: nono pull {} --force",
+                pack_ref, artifact_name, expected_digest, actual_digest, pack_ref
+            )));
+        }
+
+        let bundle_json = serde_json::to_string(bundle_value).map_err(|e| {
+            nono::NonoError::PackageInstall(format!(
+                "failed to serialize bundle for '{}' in pack '{}': {}",
+                artifact_name, pack_ref, e
+            ))
+        })?;
+        let bundle_id_path = Path::new(artifact_name);
+        let bundle = nono::trust::load_bundle_from_str(&bundle_json, bundle_id_path)?;
+
+        // `expected_digest` (now equal to the on-disk file) must be a signed
+        // subject of the bundle.
+        let subjects = nono::trust::extract_all_subjects(&bundle, bundle_id_path)?;
+        if !subjects
+            .iter()
+            .any(|(name, digest)| name == artifact_name && digest == expected_digest)
+        {
+            return Err(nono::NonoError::PackageInstall(format!(
+                "trust bundle for '{}' in pack '{}' does not contain the expected subject digest",
+                artifact_name, pack_ref
+            )));
+        }
+
+        // Verify the DSSE envelope against the offline trusted key.
+        nono::trust::verify_keyed_signature(&bundle, &spki_der, bundle_id_path).map_err(|e| {
+            nono::NonoError::PackageInstall(format!(
+                "keyed verification failed for '{}' in pack '{}': {}\n\
+                 Reinstall with: nono pull {} --force",
+                artifact_name, pack_ref, e, pack_ref
+            ))
+        })?;
+
+        // Bind the bundle's signer key_id to the pinned fingerprint.
+        let identity = nono::trust::extract_signer_identity(&bundle, bundle_id_path)?;
+        match &identity {
+            nono::trust::SignerIdentity::Keyed { key_id } if key_id == fingerprint => {}
+            nono::trust::SignerIdentity::Keyed { key_id } => {
+                return Err(nono::NonoError::PackageVerification {
+                    package: pack_ref.to_string(),
+                    reason: format!(
+                        "signer key mismatch for '{}': bundle key '{}' but lockfile pins \
+                         'keyed:{}'. Reinstall with: nono pull {} --force",
+                        artifact_name, key_id, fingerprint, pack_ref
+                    ),
+                });
+            }
+            nono::trust::SignerIdentity::Keyless { .. } => {
+                return Err(nono::NonoError::PackageVerification {
+                    package: pack_ref.to_string(),
+                    reason: format!(
+                        "keyed pack '{}' has a keyless bundle for '{}'. \
+                         Reinstall with: nono pull {} --force",
+                        pack_ref, artifact_name, pack_ref
                     ),
                 });
             }
@@ -1419,6 +1625,205 @@ mod tests {
 
         let err = match result {
             Ok(()) => panic!("tampered unsigned pack must fail verification"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("tampered"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Sign a pack's artifacts with a fresh keyed ECDSA P-256 key, write the
+    /// `.nono-trust.bundle` and a keyed lockfile entry. Returns the install dir,
+    /// the key fingerprint, and the base64 SPKI public key.
+    fn build_keyed_pack(
+        config_dir: &std::path::Path,
+        ns: &str,
+        name: &str,
+        scripts: &[(&str, &str)],
+    ) -> (PathBuf, String, String) {
+        let (install_dir, artifacts) = build_pack_with_scripts(config_dir, ns, name, scripts);
+
+        let key_pair = nono::trust::generate_signing_key().expect("keygen");
+        let fingerprint = nono::trust::key_id_hex(&key_pair).expect("fingerprint");
+        let pub_b64 = nono::trust::base64::base64_encode(
+            nono::trust::export_public_key(&key_pair)
+                .expect("pub")
+                .as_bytes(),
+        );
+
+        let files: Vec<(PathBuf, String)> = artifacts
+            .iter()
+            .map(|(n, art)| (PathBuf::from(n), art.sha256.clone()))
+            .collect();
+        let bundle_json = nono::trust::sign_files(&files, &key_pair, &fingerprint).expect("sign");
+        let bundle_value: serde_json::Value =
+            serde_json::from_str(&bundle_json).expect("bundle json");
+
+        let entries: Vec<serde_json::Value> = artifacts
+            .iter()
+            .map(|(n, art)| {
+                serde_json::json!({
+                    "artifact": n,
+                    "installed_path": n,
+                    "digest": art.sha256,
+                    "bundle": bundle_value.clone(),
+                })
+            })
+            .collect();
+        fs::write(
+            install_dir.join(".nono-trust.bundle"),
+            serde_json::to_string_pretty(&entries).expect("serialize bundle"),
+        )
+        .expect("write bundle");
+
+        write_keyed_lockfile(config_dir, &format!("{ns}/{name}"), &fingerprint, artifacts);
+
+        (install_dir, fingerprint, pub_b64)
+    }
+
+    fn write_keyed_lockfile(
+        config_dir: &std::path::Path,
+        pack_ref: &str,
+        fingerprint: &str,
+        artifacts: BTreeMap<String, package::LockedArtifact>,
+    ) {
+        let lockfile_path = config_dir
+            .join("nono")
+            .join("packages")
+            .join("lockfile.json");
+        fs::create_dir_all(lockfile_path.parent().expect("parent")).expect("packages dir");
+        let mut lockfile = package::Lockfile {
+            lockfile_version: package::LOCKFILE_VERSION,
+            registry: String::new(),
+            packages: BTreeMap::new(),
+        };
+        let pkg = package::LockedPackage {
+            artifacts,
+            provenance: Some(package::PackageProvenance {
+                signer_identity: format!("keyed:{fingerprint}"),
+                repository: pack_ref.to_string(),
+                workflow: String::new(),
+                git_ref: String::new(),
+                rekor_log_index: 0,
+                signed_at: String::new(),
+            }),
+            ..package::LockedPackage::default()
+        };
+        lockfile.packages.insert(pack_ref.to_string(), pkg);
+        fs::write(
+            &lockfile_path,
+            serde_json::to_string_pretty(&lockfile).expect("serialize lockfile"),
+        )
+        .expect("write lockfile");
+    }
+
+    fn drop_trusted_key(config_dir: &std::path::Path, fingerprint: &str, pub_b64: &str) {
+        let dir = config_dir.join("nono").join("trusted-keys");
+        fs::create_dir_all(&dir).expect("trusted-keys dir");
+        fs::write(dir.join(format!("{fingerprint}.b64")), pub_b64).expect("write trusted key");
+    }
+
+    #[test]
+    fn verify_profile_packs_keyed_verifies_with_trusted_key() {
+        let result = with_config_env(|config_dir| {
+            let (_, fp, pub_b64) = build_keyed_pack(
+                config_dir,
+                "acme",
+                "widget",
+                &[("package.json", r#"{"meta":{"name":"widget"}}"#)],
+            );
+            drop_trusted_key(config_dir, &fp, &pub_b64);
+            verify_profile_packs(&["acme/widget".to_string()], &profile::Profile::default())
+        });
+        assert!(
+            result.is_ok(),
+            "keyed pack must verify offline with the trusted key present: {result:?}"
+        );
+    }
+
+    #[test]
+    fn verify_profile_packs_keyed_fails_secure_without_trusted_key() {
+        let result = with_config_env(|config_dir| {
+            // No trusted key dropped → must fail-secure rather than degrade to
+            // SHA-256-only.
+            build_keyed_pack(
+                config_dir,
+                "acme",
+                "widget",
+                &[("package.json", r#"{"meta":{"name":"widget"}}"#)],
+            );
+            verify_profile_packs(&["acme/widget".to_string()], &profile::Profile::default())
+        });
+        let err = match result {
+            Ok(()) => panic!("keyed pack must fail without an offline trusted key"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("no trusted key"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_profile_packs_keyed_detects_tamper() {
+        let result = with_config_env(|config_dir| {
+            let (install_dir, fp, pub_b64) = build_keyed_pack(
+                config_dir,
+                "acme",
+                "widget",
+                &[("package.json", r#"{"meta":{"name":"widget"}}"#)],
+            );
+            drop_trusted_key(config_dir, &fp, &pub_b64);
+            fs::write(install_dir.join("package.json"), b"tampered").expect("tamper");
+            verify_profile_packs(&["acme/widget".to_string()], &profile::Profile::default())
+        });
+        assert!(
+            result.is_err(),
+            "tampered keyed pack must fail verification"
+        );
+    }
+
+    // An attacker without the signing key replaces the artifact AND rewrites
+    // the (mutable) lockfile digest to match, but cannot touch the signed
+    // `.nono-trust.bundle`. The keyed path must still reject this by binding the
+    // actual file to the signed subject digest (defence parity with keyless).
+    #[test]
+    fn verify_profile_packs_keyed_rejects_artifact_and_lockfile_lockstep_tamper() {
+        let result = with_config_env(|config_dir| {
+            let (install_dir, fp, pub_b64) = build_keyed_pack(
+                config_dir,
+                "acme",
+                "widget",
+                &[("package.json", r#"{"meta":{"name":"widget"}}"#)],
+            );
+            drop_trusted_key(config_dir, &fp, &pub_b64);
+
+            let malicious = b"malicious";
+            fs::write(install_dir.join("package.json"), malicious).expect("tamper file");
+            let mal_digest = {
+                let digest = Sha256::digest(malicious);
+                digest
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            };
+            // Rewrite the lockfile digest in lockstep so the outer SHA-256 check
+            // (file vs lockfile) passes; the signed bundle is left untouched.
+            let mut artifacts = BTreeMap::new();
+            artifacts.insert(
+                "package.json".to_string(),
+                package::LockedArtifact {
+                    sha256: mal_digest,
+                    artifact_type: package::ArtifactType::Profile,
+                },
+            );
+            write_keyed_lockfile(config_dir, "acme/widget", &fp, artifacts);
+
+            verify_profile_packs(&["acme/widget".to_string()], &profile::Profile::default())
+        });
+        let err = match result {
+            Ok(()) => panic!("lockstep artifact+lockfile tamper must fail keyed verification"),
             Err(err) => err,
         };
         assert!(
