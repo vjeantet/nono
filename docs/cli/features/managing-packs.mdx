@@ -320,6 +320,8 @@ trusted_key_file = "/etc/nono/nono-fleet.pub"   # or: trusted_key = "<base64 SPK
 
 Keyed mode is **fail-secure**: it cannot be silently downgraded. Combining a `trusted_key` with `verify = false` is a hard error, and `NONO_REGISTRY_INSECURE` is ignored (warned). Only an explicit `nono pull --insecure` deliberately downgrades to an unsigned install.
 
+Like `verify = false`, a configured trusted key suppresses the best-effort background lookups against the public registry (pack update hints, profile-provider migration): those endpoints are not served by a static registry, and keyed fleets are assumed air-gapped.
+
 ```bash
 nono pull my-org/my-pack    # keyed verification against the configured key
 nono run --profile ...      # offline keyed re-verification from trusted-keys/

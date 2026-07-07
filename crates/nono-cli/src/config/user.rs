@@ -333,6 +333,21 @@ pub struct RegistrySettings {
     pub trusted_key_file: Option<String>,
 }
 
+impl RegistrySettings {
+    /// True when the fleet targets an internal/static registry: keyed trust
+    /// (a trusted key is configured) or unsigned (`verify = false`).
+    ///
+    /// Static registries do not serve the public registry's ancillary
+    /// endpoints (package update status, profile providers), and both modes
+    /// promise no traffic to the public registry. Best-effort background
+    /// lookups must be skipped in this posture rather than fall through to
+    /// the compiled-in public registry URL.
+    #[must_use]
+    pub fn is_internal_registry(&self) -> bool {
+        !self.verify || self.trusted_key.is_some() || self.trusted_key_file.is_some()
+    }
+}
+
 impl Default for RegistrySettings {
     fn default() -> Self {
         Self {
@@ -479,6 +494,41 @@ alice = { name = "Alice", fingerprint = "abc123" }
         assert!(config.ui.detach_sequence.is_none());
         assert!(config.redaction.extra_flags.is_empty());
         assert!(config.redaction.extra_env_vars.is_empty());
+    }
+
+    #[test]
+    fn registry_internal_posture_covers_keyed_and_unsigned() {
+        // Default (public registry, keyless): not internal.
+        assert!(!RegistrySettings::default().is_internal_registry());
+
+        // Unsigned mode.
+        let unsigned = RegistrySettings {
+            verify: false,
+            ..RegistrySettings::default()
+        };
+        assert!(unsigned.is_internal_registry());
+
+        // Keyed mode via inline key (verify stays true).
+        let keyed_inline = RegistrySettings {
+            trusted_key: Some("aW5saW5lLWtleQ==".to_string()),
+            ..RegistrySettings::default()
+        };
+        assert!(keyed_inline.is_internal_registry());
+
+        // Keyed mode via key file (verify stays true).
+        let keyed_file = RegistrySettings {
+            trusted_key_file: Some("/etc/nono/registry.pub".to_string()),
+            ..RegistrySettings::default()
+        };
+        assert!(keyed_file.is_internal_registry());
+
+        // A custom URL alone does not flip the posture: keyless verification
+        // against a full registry still supports the public endpoints.
+        let custom_url = RegistrySettings {
+            url: Some("https://registry.example.com".to_string()),
+            ..RegistrySettings::default()
+        };
+        assert!(!custom_url.is_internal_registry());
     }
 
     #[test]

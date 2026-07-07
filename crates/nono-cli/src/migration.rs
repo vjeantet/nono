@@ -130,14 +130,15 @@ pub fn check_and_run(profile_name: &str) -> Result<MigrationOutcome> {
     } else {
         // The provider lookup is a network call to the registry's
         // `/api/v1/profiles/<name>/providers` endpoint. A static
-        // (air-gapped/internal) registry does not serve it, so skip the lookup
-        // when signature verification is disabled — the in-tree
-        // `official_pack_for` path above still works for known packs.
-        let verify = match crate::config::user::load_user_config() {
-            Ok(Some(config)) => config.registry.verify,
-            _ => true,
+        // (air-gapped/internal) registry does not serve it, so skip the
+        // lookup on the internal-registry posture (keyed trust or
+        // verification disabled) — the in-tree `official_pack_for` path
+        // above still works for known packs.
+        let internal = match crate::config::user::load_user_config() {
+            Ok(Some(config)) => config.registry.is_internal_registry(),
+            _ => false,
         };
-        if !verify {
+        if internal {
             return Ok(MigrationOutcome::NotApplicable);
         }
         match fetch_providers(profile_name) {

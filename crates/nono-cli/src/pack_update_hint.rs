@@ -303,11 +303,11 @@ fn is_opted_out() -> bool {
         return true;
     }
     match crate::config::user::load_user_config() {
-        // Also opt out when signature verification is disabled: that is the
-        // air-gapped / internal-registry posture, where the static registry
-        // does not serve the status endpoint and a background hint check would
-        // just time out on an unreachable host.
-        Ok(Some(config)) => !config.updates.check || !config.registry.verify,
+        // Also opt out on the internal-registry posture (keyed trust or
+        // verification disabled): the static registry does not serve the
+        // status endpoint, and the check would otherwise phone home to the
+        // public registry default despite the air-gapped promise.
+        Ok(Some(config)) => !config.updates.check || config.registry.is_internal_registry(),
         _ => false,
     }
 }
